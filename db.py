@@ -34,14 +34,18 @@ def utc_now() -> str:
 def get_client():
     """Create Supabase lazily so domain tests need no credentials or SDK."""
     try:
-        from supabase import create_client
+        import httpx
+        from supabase import ClientOptions, create_client
     except ImportError as error:
         raise RuntimeError("Install requirements.txt to use Supabase") from error
     url = os.getenv("SUPABASE_URL")
     key = os.getenv("SUPABASE_KEY")
     if not url or not key:
         raise RuntimeError("SUPABASE_URL and SUPABASE_KEY are required")
-    return create_client(url, key)
+    # PostgREST enables HTTP/2 by default. Some managed network paths send a
+    # GOAWAY between sequential requests, so use stable HTTP/1.1 for this API.
+    http_client = httpx.Client(http2=False, timeout=30.0, follow_redirects=True)
+    return create_client(url, key, options=ClientOptions(httpx_client=http_client))
 
 
 class SupabaseRepository:

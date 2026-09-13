@@ -1,5 +1,10 @@
+import sys
+from types import ModuleType
+
+import httpx
 import pytest
 
+import db
 from db import MemoryRepository, NotFound
 from operations import OperationConflict, execute_operation
 
@@ -36,3 +41,35 @@ def test_failed_operation_can_be_retried_with_the_same_id():
 
     assert result == {"saved": True}
     assert attempts == [1]
+
+
+def test_supabase_client_uses_http1_transport(monkeypatch):
+    recorded = {}
+    transport = object()
+    client = object()
+
+    def fake_http_client(**kwargs):
+        recorded["httpx"] = kwargs
+        return transport
+
+    class FakeClientOptions:
+        def __init__(self, **kwargs):
+            recorded["options"] = kwargs
+
+    def fake_create_client(url, key, options=None):
+        recorded["create"] = {"url": url, "key": key, "options": options}
+        return client
+
+    fake_supabase = ModuleType("supabase")
+    fake_supabase.ClientOptions = FakeClientOptions
+    fake_supabase.create_client = fake_create_client
+    monkeypatch.setitem(sys.modules, "supabase", fake_supabase)
+    monkeypatch.setattr(httpx, "Client", fake_http_client)
+    monkeypatch.setenv("SUPABASE_URL", "https://example.supabase.co")
+    monkeypatch.setenv("SUPABASE_KEY", "secret")
+
+    assert db.get_client() is client
+    assert recorded["httpx"]["http2"] is False
+    assert recorded["options"]["httpx_client"] is transport
+    assert recorded["create"]["url"] == "https://example.supabase.co"
+    assert recorded["create"]["key"] == "secret"
