@@ -11,3 +11,4 @@ Detailed plan: [MVP implementation plan](superpowers/plans/2026-09-13-personal-g
 | 5. Metrics and export | Complete | Timezone-aware weight, separate load types, history and JSON/CSV export |
 | 6. Weekly review | Complete | Strict JSON contract; tests use a fake model client |
 | 7–12. PWA, push, release | Pending | Awaiting design and later decisions |
+| Backlog: progress gamification | Idea | Active days, schedule streaks, personal records and milestones; definitions require a separate design |
