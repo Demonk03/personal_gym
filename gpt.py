@@ -153,7 +153,7 @@ class OpenAIJSONClient:
 class WeeklyReviewService:
     def __init__(self, client=None, model: str | None = None):
         self.client = client
-        self.model = model or os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+        self.model = model or os.getenv("OPENAI_MODEL", "gpt-5.6-luna")
 
     def generate(self, source: dict[str, Any], approved_exercise_ids: set[str]) -> dict[str, Any]:
         workout_ids = {
