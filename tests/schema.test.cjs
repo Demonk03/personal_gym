@@ -144,20 +144,21 @@ test("workout, set, and finish RPCs are idempotent and revision-safe", async () 
   const finishArgs = [
     "53000000-0000-4000-8000-000000000010", "finish-hash", workoutId, 1,
     "completed", "2026-09-13T12:00:00Z", null,
+    JSON.stringify({overall_difficulty: 5, back_pain: 3, leg_symptoms_change: "same"}),
   ];
   const finished = await db.query(
-    "select gym_finish_workout($1,$2,$3,$4,$5,$6,$7) as value", finishArgs,
+    "select gym_finish_workout($1,$2,$3,$4,$5,$6,$7,$8) as value", finishArgs,
   );
   const finishRepeat = await db.query(
-    "select gym_finish_workout($1,$2,$3,$4,$5,$6,$7) as value", finishArgs,
+    "select gym_finish_workout($1,$2,$3,$4,$5,$6,$7,$8) as value", finishArgs,
   );
   assert.equal(finished.rows[0].value.result.revision, 2);
   assert.equal(finishRepeat.rows[0].value.result.revision, 2);
   await assert.rejects(
     db.query(
-      "select gym_finish_workout($1,$2,$3,$4,$5,$6,$7)",
+      "select gym_finish_workout($1,$2,$3,$4,$5,$6,$7,$8)",
       ["53000000-0000-4000-8000-000000000011", "other", workoutId, 1,
-        "completed", "2026-09-13T12:01:00Z", null],
+        "completed", "2026-09-13T12:01:00Z", null, JSON.stringify({})],
     ),
   );
   await db.close();

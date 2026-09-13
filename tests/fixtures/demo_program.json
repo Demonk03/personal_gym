@@ -1,6 +1,7 @@
 {
   "id": "10000000-0000-4000-8000-000000000001",
   "session_id": "20000000-0000-4000-8000-000000000002",
+  "session_key": "full-body-a",
   "version": 1,
   "rule_version": "demo-rules-v1",
   "demo_only": true,

@@ -137,8 +137,9 @@ create table if not exists workout_sets (
 
 create table if not exists checkins (
   id uuid primary key,
-  workout_id uuid not null references workouts(id) on delete cascade,
+  workout_id uuid references workouts(id) on delete cascade,
   kind text not null check (kind in ('pre','post','next_day')),
+  checkin_date date not null default current_date,
   payload jsonb not null,
   evaluation jsonb,
   rule_version text,
@@ -288,6 +289,14 @@ begin
     coalesce(p_workout->'profile_snapshot', '{}'), p_workout->'program_snapshot'
   );
 
+  if p_workout ? 'checkin_payload' then
+    insert into checkins (id, workout_id, kind, checkin_date, payload, evaluation, rule_version)
+    values (
+      gen_random_uuid(), workout_id, 'pre', coalesce(nullif(p_workout->>'scheduled_date','')::date, current_date),
+      p_workout->'checkin_payload', p_workout->'checkin_evaluation', p_workout->>'rule_version'
+    );
+  end if;
+
   for item in select * from jsonb_array_elements(p_exercises) loop
     insert into workout_exercises (
       id, workout_id, original_exercise_id, exercise_id, position,
@@ -343,7 +352,8 @@ end $$;
 
 create or replace function gym_finish_workout(
   p_operation_id uuid, p_body_hash text, p_workout_id uuid, p_revision integer,
-  p_status text, p_finished_at timestamptz, p_stop_reason text default null
+  p_status text, p_finished_at timestamptz, p_stop_reason text default null,
+  p_post_checkin jsonb default null
 ) returns jsonb language plpgsql security definer set search_path = public as $$
 declare
   claim jsonb;
@@ -362,12 +372,158 @@ begin
   returning * into changed;
   if changed.id is null then raise exception 'revision_conflict'; end if;
 
+  if p_post_checkin is not null then
+    insert into checkins (id, workout_id, kind, checkin_date, payload)
+    values (gen_random_uuid(), p_workout_id, 'post', (p_finished_at at time zone 'UTC')::date, p_post_checkin);
+  end if;
+
   result := jsonb_build_object('workout_id', changed.id, 'status', changed.status, 'revision', changed.revision);
   perform gym_commit_operation(p_operation_id, token, result);
   return jsonb_build_object('status', 'succeeded', 'result', result);
 exception when others then
   perform gym_fail_operation(p_operation_id, token, jsonb_build_object('message', sqlerrm));
   raise;
+end $$;
+
+create or replace function gym_save_blocked_checkin(
+  p_operation_id uuid, p_body_hash text, p_payload jsonb, p_evaluation jsonb,
+  p_checkin_date date default current_date
+) returns jsonb language plpgsql security definer set search_path = public as $$
+declare claim jsonb; token uuid; result jsonb;
+begin
+  claim := gym_claim_operation(p_operation_id, 'blocked_checkin', null, p_body_hash);
+  if claim->>'status' <> 'claimed' then return claim; end if;
+  token := (claim->>'token')::uuid;
+  insert into checkins (id, workout_id, kind, checkin_date, payload, evaluation, rule_version)
+  values (p_operation_id, null, 'pre', p_checkin_date, p_payload, p_evaluation, p_evaluation->>'rule_version');
+  result := jsonb_build_object('blocked', true, 'checkin_id', p_operation_id, 'evaluation', p_evaluation);
+  perform gym_commit_operation(p_operation_id, token, result);
+  return jsonb_build_object('status', 'succeeded', 'result', result);
+end $$;
+
+create or replace function gym_start_workout(
+  p_operation_id uuid, p_body_hash text, p_workout_id uuid, p_revision integer
+) returns jsonb language plpgsql security definer set search_path = public as $$
+declare claim jsonb; token uuid; changed workouts; result jsonb;
+begin
+  claim := gym_claim_operation(p_operation_id, 'start', p_workout_id, p_body_hash);
+  if claim->>'status' <> 'claimed' then return claim; end if;
+  token := (claim->>'token')::uuid;
+  update workouts set status='in_progress', started_at=now(), revision=revision+1, updated_at=now()
+  where id=p_workout_id and status='preparing' and revision=p_revision returning * into changed;
+  if changed.id is null then raise exception 'revision_conflict'; end if;
+  result := jsonb_build_object('workout_id', changed.id, 'status', changed.status, 'revision', changed.revision);
+  perform gym_commit_operation(p_operation_id, token, result);
+  return jsonb_build_object('status','succeeded','result',result);
+end $$;
+
+create or replace function gym_reorder_workout(
+  p_operation_id uuid, p_body_hash text, p_workout_id uuid, p_revision integer, p_order uuid[]
+) returns jsonb language plpgsql security definer set search_path = public as $$
+declare claim jsonb; token uuid; current_ids uuid[]; changed workouts; result jsonb;
+begin
+  claim := gym_claim_operation(p_operation_id, 'reorder', p_workout_id, p_body_hash);
+  if claim->>'status' <> 'claimed' then return claim; end if;
+  token := (claim->>'token')::uuid;
+  select array_agg(id order by id) into current_ids from workout_exercises where workout_id=p_workout_id;
+  if cardinality(p_order) <> cardinality(array(select distinct unnest(p_order)))
+     or current_ids is distinct from array(select unnest(p_order) order by 1) then
+    raise exception 'invalid_exercise_order';
+  end if;
+  if not exists(select 1 from workouts where id=p_workout_id and status in ('preparing','in_progress') and revision=p_revision) then
+    raise exception 'revision_conflict';
+  end if;
+  update workout_exercises e set position=o.position
+  from unnest(p_order) with ordinality as o(id,position)
+  where e.id=o.id and e.workout_id=p_workout_id;
+  update workouts set revision=revision+1,updated_at=now() where id=p_workout_id returning * into changed;
+  result := jsonb_build_object('workout_id',changed.id,'status',changed.status,'revision',changed.revision);
+  perform gym_commit_operation(p_operation_id,token,result);
+  return jsonb_build_object('status','succeeded','result',result);
+end $$;
+
+create or replace function gym_replace_workout_exercise(
+  p_operation_id uuid, p_body_hash text, p_workout_id uuid, p_revision integer,
+  p_entry_id uuid, p_replacement_id text, p_reason text default ''
+) returns jsonb language plpgsql security definer set search_path = public as $$
+declare claim jsonb; token uuid; entry workout_exercises; changed workouts; result jsonb;
+begin
+  claim := gym_claim_operation(p_operation_id, 'replace', p_workout_id, p_body_hash);
+  if claim->>'status' <> 'claimed' then return claim; end if;
+  token := (claim->>'token')::uuid;
+  select * into entry from workout_exercises where id=p_entry_id and workout_id=p_workout_id for update;
+  if entry.id is null then raise exception 'workout_exercise_not_found'; end if;
+  if not exists(
+    select 1 from workouts w, jsonb_array_elements(w.program_snapshot->'exercises') source
+    where w.id=p_workout_id and source->>'exercise_id'=entry.original_exercise_id
+      and coalesce(source->'allowed_replacements','[]') ? p_replacement_id
+  ) or not exists(select 1 from exercise_library where id=p_replacement_id) then
+    raise exception 'replacement_not_allowed';
+  end if;
+  if not exists(select 1 from workouts where id=p_workout_id and status in ('preparing','in_progress') and revision=p_revision) then
+    raise exception 'revision_conflict';
+  end if;
+  update workout_exercises set exercise_id=p_replacement_id,replacement_reason=p_reason,revision=revision+1 where id=p_entry_id;
+  update workouts set revision=revision+1,updated_at=now() where id=p_workout_id returning * into changed;
+  result := jsonb_build_object('workout_id',changed.id,'status',changed.status,'revision',changed.revision);
+  perform gym_commit_operation(p_operation_id,token,result);
+  return jsonb_build_object('status','succeeded','result',result);
+end $$;
+
+create or replace function gym_cancel_workout(
+  p_operation_id uuid, p_body_hash text, p_workout_id uuid, p_revision integer, p_reason text default ''
+) returns jsonb language plpgsql security definer set search_path = public as $$
+declare claim jsonb; token uuid; changed workouts; result jsonb;
+begin
+  claim := gym_claim_operation(p_operation_id, 'cancel', p_workout_id, p_body_hash);
+  if claim->>'status' <> 'claimed' then return claim; end if;
+  token := (claim->>'token')::uuid;
+  update workouts set status='cancelled',finished_at=now(),stop_reason=p_reason,revision=revision+1,updated_at=now()
+  where id=p_workout_id and status='preparing' and revision=p_revision returning * into changed;
+  if changed.id is null then raise exception 'revision_conflict'; end if;
+  result := jsonb_build_object('workout_id',changed.id,'status',changed.status,'revision',changed.revision);
+  perform gym_commit_operation(p_operation_id,token,result);
+  return jsonb_build_object('status','succeeded','result',result);
+end $$;
+
+create or replace function gym_save_next_day_checkin(
+  p_operation_id uuid, p_body_hash text, p_workout_id uuid, p_revision integer, p_payload jsonb
+) returns jsonb language plpgsql security definer set search_path = public as $$
+declare claim jsonb; token uuid; changed workouts; checkin_id uuid := gen_random_uuid(); result jsonb;
+begin
+  claim := gym_claim_operation(p_operation_id, 'next_day_checkin', p_workout_id, p_body_hash);
+  if claim->>'status' <> 'claimed' then return claim; end if;
+  token := (claim->>'token')::uuid;
+  if not exists(select 1 from workouts where id=p_workout_id and status in ('completed','stopped_early') and revision=p_revision) then
+    raise exception 'revision_conflict';
+  end if;
+  insert into checkins(id,workout_id,kind,payload) values(checkin_id,p_workout_id,'next_day',p_payload);
+  update workouts set revision=revision+1,updated_at=now() where id=p_workout_id returning * into changed;
+  result := jsonb_build_object('workout_id',changed.id,'status',changed.status,'revision',changed.revision,'checkin_id',checkin_id);
+  perform gym_commit_operation(p_operation_id,token,result);
+  return jsonb_build_object('status','succeeded','result',result);
+end $$;
+
+create or replace function gym_update_set(
+  p_operation_id uuid, p_body_hash text, p_workout_id uuid, p_revision integer,
+  p_set_id uuid, p_set_revision integer, p_set_data jsonb
+) returns jsonb language plpgsql security definer set search_path = public as $$
+declare claim jsonb; token uuid; changed workout_sets; result jsonb;
+begin
+  claim := gym_claim_operation(p_operation_id, 'update_set', p_workout_id, p_body_hash);
+  if claim->>'status' <> 'claimed' then return claim; end if;
+  token := (claim->>'token')::uuid;
+  update workout_sets set
+    actual_reps=coalesce((p_set_data->>'actual_reps')::integer,actual_reps),
+    actual_seconds=coalesce((p_set_data->>'actual_seconds')::integer,actual_seconds),
+    actual_weight_kg=coalesce((p_set_data->>'actual_weight_kg')::numeric,actual_weight_kg),
+    difficulty=coalesce((p_set_data->>'difficulty')::integer,difficulty),
+    effect=coalesce(p_set_data->>'effect',effect), revision=revision+1
+  where id=p_set_id and workout_id=p_workout_id and revision=p_set_revision returning * into changed;
+  if changed.id is null then raise exception 'revision_conflict'; end if;
+  result := jsonb_build_object('set_id',changed.id,'revision',changed.revision);
+  perform gym_commit_operation(p_operation_id,token,result);
+  return jsonb_build_object('status','succeeded','result',result);
 end $$;
 
 alter table player_profile enable row level security;
@@ -392,6 +548,13 @@ revoke all on function gym_fail_operation(uuid,uuid,jsonb) from public;
 revoke all on function gym_commit_operation(uuid,uuid,jsonb) from public;
 revoke all on function gym_create_prepared_workout(uuid,text,jsonb,jsonb) from public;
 revoke all on function gym_save_set(uuid,text,jsonb) from public;
-revoke all on function gym_finish_workout(uuid,text,uuid,integer,text,timestamptz,text) from public;
+revoke all on function gym_finish_workout(uuid,text,uuid,integer,text,timestamptz,text,jsonb) from public;
+revoke all on function gym_save_blocked_checkin(uuid,text,jsonb,jsonb,date) from public;
+revoke all on function gym_start_workout(uuid,text,uuid,integer) from public;
+revoke all on function gym_reorder_workout(uuid,text,uuid,integer,uuid[]) from public;
+revoke all on function gym_replace_workout_exercise(uuid,text,uuid,integer,uuid,text,text) from public;
+revoke all on function gym_cancel_workout(uuid,text,uuid,integer,text) from public;
+revoke all on function gym_save_next_day_checkin(uuid,text,uuid,integer,jsonb) from public;
+revoke all on function gym_update_set(uuid,text,uuid,integer,uuid,integer,jsonb) from public;
 
 commit;
