@@ -103,12 +103,14 @@ test("workout, set, and finish RPCs are idempotent and revision-safe", async () 
     demo_only: true,
     rule_version: "demo-rules-v1",
     profile_snapshot: {},
-    program_snapshot: {},
+    program_snapshot: {
+      exercises: [{exercise_id: "incline-pushup", allowed_replacements: ["wall-pushup"]}],
+    },
   });
   const exercises = JSON.stringify([{
     id: exerciseEntryId,
-    original_exercise_id: "bird-dog",
-    exercise_id: "bird-dog",
+    original_exercise_id: "incline-pushup",
+    exercise_id: "incline-pushup",
     position: 1,
     planned_sets: 3,
     planned_reps: 6,
@@ -127,7 +129,21 @@ test("workout, set, and finish RPCs are idempotent and revision-safe", async () 
   const workoutCount = await db.query("select count(*)::int as count from workouts");
   assert.equal(workoutCount.rows[0].count, 1);
 
-  await db.query("update workouts set status='in_progress' where id=$1", [workoutId]);
+  const started = await db.query(
+    "select gym_start_workout($1,'start-hash',$2,1) as value",
+    ["51100000-0000-4000-8000-000000000010", workoutId],
+  );
+  assert.equal(started.rows[0].value.result.revision, 2);
+  const reordered = await db.query(
+    "select gym_reorder_workout($1,'order-hash',$2,2,array[$3::uuid]) as value",
+    ["51200000-0000-4000-8000-000000000010", workoutId, exerciseEntryId],
+  );
+  assert.equal(reordered.rows[0].value.result.revision, 3);
+  const replaced = await db.query(
+    "select gym_replace_workout_exercise($1,'replace-hash',$2,3,$3,'wall-pushup','demo') as value",
+    ["51300000-0000-4000-8000-000000000010", workoutId, exerciseEntryId],
+  );
+  assert.equal(replaced.rows[0].value.result.revision, 4);
   const setBody = JSON.stringify({
     id: "42000000-0000-4000-8000-000000000010",
     workout_id: workoutId,
@@ -142,7 +158,7 @@ test("workout, set, and finish RPCs are idempotent and revision-safe", async () 
   assert.equal(setCount.rows[0].count, 1);
 
   const finishArgs = [
-    "53000000-0000-4000-8000-000000000010", "finish-hash", workoutId, 1,
+    "53000000-0000-4000-8000-000000000010", "finish-hash", workoutId, 4,
     "completed", "2026-09-13T12:00:00Z", null,
     JSON.stringify({overall_difficulty: 5, back_pain: 3, leg_symptoms_change: "same"}),
   ];
@@ -152,15 +168,21 @@ test("workout, set, and finish RPCs are idempotent and revision-safe", async () 
   const finishRepeat = await db.query(
     "select gym_finish_workout($1,$2,$3,$4,$5,$6,$7,$8) as value", finishArgs,
   );
-  assert.equal(finished.rows[0].value.result.revision, 2);
-  assert.equal(finishRepeat.rows[0].value.result.revision, 2);
+  assert.equal(finished.rows[0].value.result.revision, 5);
+  assert.equal(finishRepeat.rows[0].value.result.revision, 5);
   await assert.rejects(
     db.query(
       "select gym_finish_workout($1,$2,$3,$4,$5,$6,$7,$8)",
-      ["53000000-0000-4000-8000-000000000011", "other", workoutId, 1,
+      ["53000000-0000-4000-8000-000000000011", "other", workoutId, 4,
         "completed", "2026-09-13T12:01:00Z", null, JSON.stringify({})],
     ),
   );
+  const nextDay = await db.query(
+    "select gym_save_next_day_checkin($1,'next-hash',$2,5,$3) as value",
+    ["53100000-0000-4000-8000-000000000010", workoutId,
+      JSON.stringify({pain_change: "same", ready_for_similar_load: true})],
+  );
+  assert.equal(nextDay.rows[0].value.result.revision, 6);
   await db.close();
 });
 
