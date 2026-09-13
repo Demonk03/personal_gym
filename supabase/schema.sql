@@ -86,6 +86,7 @@ create table if not exists workouts (
   checkin_mode text not null check (checkin_mode in ('green','yellow','red')),
   checkin_reasons text[] not null default '{}',
   demo_only boolean not null default true,
+  is_extra boolean not null default false,
   rule_version text not null,
   profile_snapshot jsonb not null default '{}',
   program_snapshot jsonb not null,
@@ -526,6 +527,41 @@ begin
   return jsonb_build_object('status','succeeded','result',result);
 end $$;
 
+create or replace function gym_create_weight(
+  p_operation_id uuid, p_body_hash text, p_entry jsonb
+) returns jsonb language plpgsql security definer set search_path = public as $$
+declare claim jsonb; token uuid; result jsonb;
+begin
+  claim := gym_claim_operation(p_operation_id, 'create_weight', (p_entry->>'id')::uuid, p_body_hash);
+  if claim->>'status' <> 'claimed' then return claim; end if;
+  token := (claim->>'token')::uuid;
+  insert into weight_entries(id,weight_kg,measured_at)
+  values((p_entry->>'id')::uuid,(p_entry->>'weight_kg')::numeric,(p_entry->>'measured_at')::timestamptz);
+  result := jsonb_build_object('id',p_entry->>'id','weight_kg',(p_entry->>'weight_kg')::numeric,
+    'measured_at',p_entry->>'measured_at','revision',1);
+  perform gym_commit_operation(p_operation_id,token,result);
+  return jsonb_build_object('status','succeeded','result',result);
+end $$;
+
+create or replace function gym_update_weight(
+  p_operation_id uuid, p_body_hash text, p_entry_id uuid, p_revision integer,
+  p_weight_kg numeric, p_measured_at timestamptz
+) returns jsonb language plpgsql security definer set search_path = public as $$
+declare claim jsonb; token uuid; changed weight_entries; result jsonb;
+begin
+  claim := gym_claim_operation(p_operation_id, 'update_weight', p_entry_id, p_body_hash);
+  if claim->>'status' <> 'claimed' then return claim; end if;
+  token := (claim->>'token')::uuid;
+  update weight_entries set weight_kg=p_weight_kg,measured_at=p_measured_at,
+    revision=revision+1,updated_at=now()
+  where id=p_entry_id and revision=p_revision returning * into changed;
+  if changed.id is null then raise exception 'revision_conflict'; end if;
+  result := jsonb_build_object('id',changed.id,'weight_kg',changed.weight_kg,
+    'measured_at',changed.measured_at,'revision',changed.revision);
+  perform gym_commit_operation(p_operation_id,token,result);
+  return jsonb_build_object('status','succeeded','result',result);
+end $$;
+
 alter table player_profile enable row level security;
 alter table exercise_library enable row level security;
 alter table exercise_replacements enable row level security;
@@ -556,5 +592,7 @@ revoke all on function gym_replace_workout_exercise(uuid,text,uuid,integer,uuid,
 revoke all on function gym_cancel_workout(uuid,text,uuid,integer,text) from public;
 revoke all on function gym_save_next_day_checkin(uuid,text,uuid,integer,jsonb) from public;
 revoke all on function gym_update_set(uuid,text,uuid,integer,uuid,integer,jsonb) from public;
+revoke all on function gym_create_weight(uuid,text,jsonb) from public;
+revoke all on function gym_update_weight(uuid,text,uuid,integer,numeric,timestamptz) from public;
 
 commit;

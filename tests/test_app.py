@@ -199,3 +199,46 @@ def test_cancel_only_preparing_workout(client, auth):
     assert cancelled.status_code == 200
     assert cancelled.get_json()["workout"]["status"] == "cancelled"
     assert restart.status_code == 409
+
+
+def test_weight_history_progress_and_exports(client, auth, repository):
+    repository.profile["target_weight_kg"] = 85
+    create_body = operation(weight_kg=92.4, measured_at="2026-09-01T08:00:00+02:00")
+    created = client.post("/api/weight", json=create_body, headers=auth)
+    repeated = client.post("/api/weight", json=create_body, headers=auth)
+    assert created.status_code == repeated.status_code == 201
+    assert created.get_json() == repeated.get_json()
+
+    entry = created.get_json()
+    updated = client.put(
+        f"/api/weight/{entry['id']}",
+        json=operation(revision=1, weight_kg=92.0, measured_at="2026-09-01T08:00:00+02:00"), headers=auth,
+    )
+    stale = client.put(
+        f"/api/weight/{entry['id']}",
+        json=operation(revision=1, weight_kg=91.9, measured_at="2026-09-01T08:00:00+02:00"), headers=auth,
+    )
+    assert updated.status_code == 200
+    assert updated.get_json()["revision"] == 2
+    assert stale.status_code == 409
+
+    progress = client.get("/api/progress?from=2026-09-01&to=2026-09-30", headers=auth)
+    history = client.get("/api/history?from=2026-09-01&to=2026-09-30", headers=auth)
+    json_export = client.get("/api/export.json", headers=auth)
+    csv_export = client.get("/api/export.csv", headers=auth)
+
+    assert progress.status_code == history.status_code == 200
+    assert progress.get_json()["weight"]["current_kg"] == 92.0
+    assert progress.get_json()["weight"]["to_target_kg"] == 7.0
+    assert history.get_json() == {"workouts": []}
+    exported = json_export.get_json()
+    assert "gym_operations" not in exported["data"]
+    assert "push_subscriptions" not in exported["data"]
+    assert "record_type,id,measured_at" in csv_export.get_data(as_text=True)
+    assert "weight" in csv_export.get_data(as_text=True)
+
+
+def test_progress_rejects_invalid_period(client, auth):
+    missing = client.get("/api/progress", headers=auth)
+    backwards = client.get("/api/progress?from=2026-09-30&to=2026-09-01", headers=auth)
+    assert missing.status_code == backwards.status_code == 400

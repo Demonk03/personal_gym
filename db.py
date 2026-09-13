@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 from copy import deepcopy
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 from uuid import uuid4
 
@@ -164,6 +164,81 @@ class SupabaseRepository:
             "p_stop_reason": stop_reason, "p_post_checkin": post_checkin,
         })
         return self.get_workout(result["workout_id"])
+
+    def list_history(self, date_from=None, date_to=None):
+        query = self.client.table("workouts").select("*").order("scheduled_date", desc=True).order("created_at", desc=True)
+        if date_from:
+            query = query.gte("scheduled_date", date_from)
+        if date_to:
+            query = query.lte("scheduled_date", date_to)
+        return query.execute().data
+
+    def _planned_dates(self, date_from, date_to):
+        if not date_from or not date_to:
+            return []
+        versions = self.client.table("program_versions").select("id").eq("active", True).limit(1).execute().data
+        if not versions:
+            return []
+        sessions = self.client.table("program_sessions").select("weekday").eq("program_version_id", versions[0]["id"]).execute().data
+        weekdays = {row["weekday"] for row in sessions if row.get("weekday")}
+        cursor, end = date.fromisoformat(date_from), date.fromisoformat(date_to)
+        values = []
+        while cursor <= end:
+            if cursor.isoweekday() in weekdays:
+                values.append(cursor.isoformat())
+            cursor += timedelta(days=1)
+        return values
+
+    def progress_data(self, date_from=None, date_to=None):
+        workouts = self.list_history(date_from, date_to)
+        workout_ids = [row["id"] for row in workouts]
+        if not workout_ids:
+            sets, checkins = [], []
+        else:
+            sets = self.client.table("workout_sets").select("*").in_("workout_id", workout_ids).execute().data
+            checkins = self.client.table("checkins").select("*").in_("workout_id", workout_ids).execute().data
+        weight_query = self.client.table("weight_entries").select("*").order("measured_at")
+        if date_from:
+            weight_query = weight_query.gte("measured_at", f"{date_from}T00:00:00Z")
+        if date_to:
+            weight_query = weight_query.lt("measured_at", f"{(date.fromisoformat(date_to) + timedelta(days=1)).isoformat()}T00:00:00Z")
+        weights = weight_query.execute().data
+        entries = self.client.table("workout_exercises").select("id,exercise_id").in_("workout_id", workout_ids).execute().data if workout_ids else []
+        entry_map = {row["id"]: row["exercise_id"] for row in entries}
+        exercise_ids = list(set(entry_map.values()))
+        library_rows = self.client.table("exercise_library").select("id,equipment,measurement_type").in_("id", exercise_ids).execute().data if exercise_ids else []
+        library = {row["id"]: row for row in library_rows}
+        for item in sets:
+            definition = library.get(entry_map.get(item["workout_exercise_id"]), {})
+            if float(item.get("actual_weight_kg") or 0) > 0:
+                item["load_category"] = "external_weight"
+            elif "bands" in definition.get("equipment", []):
+                item["load_category"] = "band"
+            elif definition.get("measurement_type") == "seconds":
+                item["load_category"] = "time"
+            else:
+                item["load_category"] = "bodyweight"
+        return {
+            "workouts": workouts, "sets": sets, "checkins": checkins,
+            "weight_entries": weights, "planned_session_dates": self._planned_dates(date_from, date_to),
+        }
+
+    def create_weight(self, operation_id, payload_hash, entry):
+        return self._rpc("gym_create_weight", {"p_operation_id": operation_id, "p_body_hash": payload_hash, "p_entry": entry})
+
+    def update_weight(self, operation_id, payload_hash, entry_id, revision, weight_kg, measured_at):
+        return self._rpc("gym_update_weight", {
+            "p_operation_id": operation_id, "p_body_hash": payload_hash, "p_entry_id": entry_id,
+            "p_revision": revision, "p_weight_kg": weight_kg, "p_measured_at": measured_at,
+        })
+
+    def export_data(self):
+        tables = (
+            "player_profile", "exercise_library", "exercise_replacements", "program_versions",
+            "program_sessions", "program_session_exercises", "workouts", "workout_exercises",
+            "workout_sets", "checkins", "weight_entries", "weekly_reviews",
+        )
+        return {table: self.client.table(table).select("*").execute().data for table in tables}
 
 
 def demo_rules(version: str = "demo-rules-v1") -> dict[str, Any]:
@@ -376,3 +451,73 @@ class MemoryRepository:
             }
             return self.get_workout(workout_id)
         return execute_operation(self, operation_id, "finish_workout", workout_id, payload, finish, payload_hash)
+
+    def list_history(self, date_from=None, date_to=None):
+        rows = list(self.workouts.values())
+        if date_from:
+            rows = [row for row in rows if row.get("scheduled_date") and row["scheduled_date"] >= date_from]
+        if date_to:
+            rows = [row for row in rows if row.get("scheduled_date") and row["scheduled_date"] <= date_to]
+        return sorted((deepcopy(row) for row in rows), key=lambda row: (row.get("scheduled_date") or "", row["created_at"]), reverse=True)
+
+    def progress_data(self, date_from=None, date_to=None):
+        workouts = self.list_history(date_from, date_to)
+        ids = {row["id"] for row in workouts}
+        sets = []
+        for row in self.sets.values():
+            if row["workout_id"] not in ids:
+                continue
+            item = deepcopy(row)
+            entry = self.exercises[item["workout_exercise_id"]]
+            definition = self.workouts[row["workout_id"]]["program_snapshot"].get("exercise_library", {}).get(entry["exercise_id"], {})
+            if float(item.get("actual_weight_kg") or 0) > 0:
+                item["load_category"] = "external_weight"
+            elif "bands" in definition.get("equipment", []):
+                item["load_category"] = "band"
+            elif definition.get("measurement_type") == "seconds":
+                item["load_category"] = "time"
+            else:
+                item["load_category"] = "bodyweight"
+            sets.append(item)
+        checkins = [deepcopy(row) for row in self.checkins.values() if row.get("workout_id") in ids]
+        weights = [deepcopy(row) for row in self.weights.values()]
+        if date_from:
+            weights = [row for row in weights if row["measured_at"][:10] >= date_from]
+        if date_to:
+            weights = [row for row in weights if row["measured_at"][:10] <= date_to]
+        return {"workouts": workouts, "sets": sets, "checkins": checkins, "weight_entries": weights, "planned_session_dates": []}
+
+    def create_weight(self, operation_id, payload_hash, entry):
+        def save():
+            if entry["id"] in self.weights:
+                raise Conflict("weight_entry_exists")
+            self.weights[entry["id"]] = {**deepcopy(entry), "revision": 1, "created_at": utc_now(), "updated_at": utc_now()}
+            return deepcopy(self.weights[entry["id"]])
+        return execute_operation(self, operation_id, "create_weight", entry["id"], entry, save, payload_hash)
+
+    def update_weight(self, operation_id, payload_hash, entry_id, revision, weight_kg, measured_at):
+        payload = {"id": entry_id, "revision": revision, "weight_kg": weight_kg, "measured_at": measured_at}
+        def save():
+            entry = self.weights.get(entry_id)
+            if not entry:
+                raise NotFound("weight_entry_not_found")
+            if entry["revision"] != revision:
+                raise RevisionConflict("revision_conflict")
+            entry.update(weight_kg=weight_kg, measured_at=measured_at, revision=revision + 1, updated_at=utc_now())
+            return deepcopy(entry)
+        return execute_operation(self, operation_id, "update_weight", entry_id, payload, save, payload_hash)
+
+    def export_data(self):
+        return {
+            "player_profile": [deepcopy(self.profile)],
+            "exercise_library": list(deepcopy((self.program or {}).get("exercise_library", {})).values()),
+            "exercise_replacements": [],
+            "program_versions": [deepcopy(self.program)] if self.program else [],
+            "program_sessions": [], "program_session_exercises": [],
+            "workouts": list(deepcopy(self.workouts).values()),
+            "workout_exercises": list(deepcopy(self.exercises).values()),
+            "workout_sets": list(deepcopy(self.sets).values()),
+            "checkins": list(deepcopy(self.checkins).values()),
+            "weight_entries": list(deepcopy(self.weights).values()),
+            "weekly_reviews": list(deepcopy(self.reviews).values()),
+        }

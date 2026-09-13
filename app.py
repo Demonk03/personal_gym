@@ -1,4 +1,6 @@
 import hmac
+import csv
+import io
 import os
 from datetime import date, datetime, timezone
 from functools import wraps
@@ -10,6 +12,7 @@ from werkzeug.exceptions import HTTPException
 
 import db
 import operations
+from metrics import build_progress
 from training import build_workout, evaluate_checkin
 
 
@@ -83,6 +86,17 @@ def _date(payload: dict[str, Any], field: str):
         return date.fromisoformat(value).isoformat()
     except ValueError:
         raise APIError(f"Поле {field} должно быть датой YYYY-MM-DD") from None
+
+
+def _timestamp(payload: dict[str, Any], field: str) -> str:
+    value = _text(payload, field, required=True, max_length=50)
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        raise APIError(f"Поле {field} должно быть временем ISO 8601") from None
+    if parsed.tzinfo is None:
+        raise APIError(f"Поле {field} должно содержать часовой пояс")
+    return parsed.isoformat()
 
 
 def _post_checkin(payload: Any) -> dict[str, Any]:
@@ -347,6 +361,98 @@ def create_app(repository=None, weekly_review_service=None) -> Flask:
             p_workout_id=_uuid(workout_id, "workout_id"), p_revision=_integer(payload, "revision", 1, 1_000_000),
             p_payload=_next_day_checkin(payload.get("checkin")))
         return jsonify(result), 201
+
+    @app.get("/api/history")
+    @require_api_key
+    def history():
+        date_from = request.args.get("from")
+        date_to = request.args.get("to")
+        for name, value in (("from", date_from), ("to", date_to)):
+            if value:
+                try:
+                    date.fromisoformat(value)
+                except ValueError:
+                    raise APIError(f"Параметр {name} должен быть датой YYYY-MM-DD") from None
+        if date_from and date_to and date_from > date_to:
+            raise APIError("Начало периода должно быть раньше конца")
+        return jsonify({"workouts": repo().list_history(date_from, date_to)})
+
+    @app.get("/api/history/<workout_id>")
+    @require_api_key
+    def history_item(workout_id):
+        return jsonify(repo().get_workout(_uuid(workout_id, "workout_id")))
+
+    @app.get("/api/progress")
+    @require_api_key
+    def progress():
+        date_from = request.args.get("from")
+        date_to = request.args.get("to")
+        if not date_from or not date_to:
+            raise APIError("Укажи параметры from и to")
+        try:
+            date.fromisoformat(date_from)
+            date.fromisoformat(date_to)
+        except ValueError:
+            raise APIError("Период должен использовать даты YYYY-MM-DD") from None
+        if date_from > date_to:
+            raise APIError("Начало периода должно быть раньше конца")
+        profile = repo().bootstrap().get("profile") or {}
+        result = build_progress(
+            repo().progress_data(date_from, date_to),
+            profile.get("timezone", "Europe/Belgrade"), profile.get("target_weight_kg"),
+        )
+        return jsonify(result)
+
+    @app.post("/api/weight")
+    @require_api_key
+    def create_weight():
+        payload, operation_id, digest = mutation_payload()
+        entry = {
+            "id": str(uuid5(NAMESPACE_URL, f"personal-gym:{operation_id}:weight")),
+            "weight_kg": _number(payload, "weight_kg", 25, 400, required=True),
+            "measured_at": _timestamp(payload, "measured_at"),
+        }
+        return jsonify(repo().create_weight(operation_id, digest, entry)), 201
+
+    @app.put("/api/weight/<entry_id>")
+    @require_api_key
+    def update_weight(entry_id):
+        payload, operation_id, digest = mutation_payload()
+        result = repo().update_weight(
+            operation_id, digest, _uuid(entry_id, "entry_id"),
+            _integer(payload, "revision", 1, 1_000_000),
+            _number(payload, "weight_kg", 25, 400, required=True),
+            _timestamp(payload, "measured_at"),
+        )
+        return jsonify(result)
+
+    @app.get("/api/export.json")
+    @require_api_key
+    def export_json():
+        return jsonify({"version": 1, "exported_at": datetime.now(timezone.utc).isoformat(), "data": repo().export_data()})
+
+    @app.get("/api/export.csv")
+    @require_api_key
+    def export_csv():
+        data = repo().export_data()
+        buffer = io.StringIO()
+        fields = [
+            "record_type", "id", "measured_at", "weight_kg", "workout_id",
+            "workout_exercise_id", "set_number", "actual_reps", "actual_seconds", "actual_weight_kg",
+        ]
+        writer = csv.DictWriter(buffer, fieldnames=fields)
+        writer.writeheader()
+        for item in data.get("weight_entries", []):
+            writer.writerow({
+                "record_type": "weight", "id": item.get("id"),
+                "measured_at": item.get("measured_at"), "weight_kg": item.get("weight_kg"),
+            })
+        for item in data.get("workout_sets", []):
+            writer.writerow({key: value for key, value in {"record_type": "set", **item}.items() if key in fields})
+        return Response(
+            buffer.getvalue(), content_type="text/csv; charset=utf-8",
+            headers={"Content-Disposition": "attachment; filename=personal-gym-export.csv"},
+        )
 
     return app
 
