@@ -172,3 +172,28 @@ test("RLS is enabled on personal tables", async () => {
   assert.equal(result.rows[0].enabled, true);
   await db.close();
 });
+
+test("weekly review and operation result commit in one database call", async () => {
+  const db = await database();
+  const operationId = "54000000-0000-4000-8000-000000000001";
+  const reviewId = "55000000-0000-4000-8000-000000000001";
+  const sourceId = "56000000-0000-4000-8000-000000000001";
+  const claim = await db.query(
+    "select gym_claim_operation($1,'weekly_review',$2,'review-hash') as value",
+    [operationId, reviewId],
+  );
+  const record = JSON.stringify({
+    id: reviewId, week_start: "2026-09-07", source_hash: "source-hash",
+    source_workout_ids: [sourceId], prompt_version: "v1", model: "fake",
+    result: {summary: "ok"},
+  });
+  const saved = await db.query(
+    "select gym_commit_weekly_review($1,$2,$3) as value",
+    [operationId, claim.rows[0].value.token, record],
+  );
+  const operation = await db.query("select status,result from gym_operations where id=$1", [operationId]);
+  assert.equal(saved.rows[0].value.status, "ready");
+  assert.equal(operation.rows[0].status, "succeeded");
+  assert.equal(operation.rows[0].result.status, "ready");
+  await db.close();
+});

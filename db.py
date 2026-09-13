@@ -105,6 +105,28 @@ class SupabaseRepository:
             raise NotFound("operation_not_found")
         return rows[0]
 
+    def claim_operation(self, operation_id, kind, resource_id, payload_hash):
+        try:
+            value = self.client.rpc("gym_claim_operation", {
+                "p_id": operation_id, "p_kind": kind, "p_resource_id": resource_id, "p_hash": payload_hash,
+            }).execute().data
+        except Exception as error:
+            code = str(getattr(error, "code", ""))
+            if code == "23505" or '"code":"23505"' in str(error).replace(" ", ""):
+                return {"status": "pending"}
+            raise
+        return value[0] if isinstance(value, list) and value else value
+
+    def commit_operation(self, operation_id, token, result):
+        return self.client.rpc("gym_commit_operation", {
+            "p_id": operation_id, "p_token": token, "p_result": result,
+        }).execute().data
+
+    def fail_operation(self, operation_id, token, error):
+        return self.client.rpc("gym_fail_operation", {
+            "p_id": operation_id, "p_token": token, "p_error": error,
+        }).execute().data
+
     def _rpc(self, name: str, params: dict[str, Any]) -> dict[str, Any]:
         try:
             value = self.client.rpc(name, params).execute().data
@@ -240,6 +262,34 @@ class SupabaseRepository:
         )
         return {table: self.client.table(table).select("*").execute().data for table in tables}
 
+    def weekly_source(self, week_start):
+        end = (date.fromisoformat(week_start) + timedelta(days=6)).isoformat()
+        workouts = self.client.table("workouts").select("*").gte("scheduled_date", week_start).lte("scheduled_date", end).in_("status", ["completed", "stopped_early", "cancelled"]).order("scheduled_date").order("id").execute().data
+        ids = [row["id"] for row in workouts]
+        sets = self.client.table("workout_sets").select("*").in_("workout_id", ids).order("completed_at").order("id").execute().data if ids else []
+        checkins = self.client.table("checkins").select("*").in_("workout_id", ids).order("created_at").order("id").execute().data if ids else []
+        return {"week_start": week_start, "workouts": workouts, "sets": sets, "checkins": checkins}
+
+    def approved_exercise_ids(self):
+        rows = self.client.table("exercise_library").select("id").eq("approved", True).eq("active", True).execute().data
+        return {row["id"] for row in rows}
+
+    def get_current_weekly_review(self, week_start):
+        rows = self.client.table("weekly_reviews").select("*").eq("week_start", week_start).order("created_at", desc=True).limit(1).execute().data
+        return rows[0] if rows else None
+
+    def commit_weekly_review(self, operation_id, token, review):
+        value = self.client.rpc("gym_commit_weekly_review", {
+            "p_operation_id": operation_id, "p_token": token, "p_review": review,
+        }).execute().data
+        return value[0] if isinstance(value, list) and value else value
+
+    def fail_weekly_review(self, operation_id, token, review, error):
+        value = self.client.rpc("gym_fail_weekly_review", {
+            "p_operation_id": operation_id, "p_token": token, "p_review": review, "p_error": error,
+        }).execute().data
+        return value[0] if isinstance(value, list) and value else value
+
 
 def demo_rules(version: str = "demo-rules-v1") -> dict[str, Any]:
     return {"version": version, "demo_only": True, "yellow": {"pain_at_least": 7, "readiness_at_most": 2}}
@@ -274,7 +324,11 @@ class MemoryRepository:
                 return {"status": "conflict"}
             if existing["status"] == "succeeded":
                 return {"status": "succeeded", "result": deepcopy(existing["result"])}
-            return {"status": "pending"}
+            if existing["status"] == "pending":
+                return {"status": "pending"}
+            token = str(uuid4())
+            existing.update(status="pending", token=token, error=None)
+            return {"status": "claimed", "token": token}
         token = str(uuid4())
         self.operations[operation_id] = {
             "kind": kind, "resource_id": resource_id, "body_hash": payload_hash,
@@ -521,3 +575,41 @@ class MemoryRepository:
             "weight_entries": list(deepcopy(self.weights).values()),
             "weekly_reviews": list(deepcopy(self.reviews).values()),
         }
+
+    def weekly_source(self, week_start):
+        end = (date.fromisoformat(week_start) + timedelta(days=6)).isoformat()
+        workouts = sorted(
+            (deepcopy(row) for row in self.workouts.values()
+             if week_start <= (row.get("scheduled_date") or "") <= end
+             and row["status"] in {"completed", "stopped_early", "cancelled"}),
+            key=lambda row: ((row.get("scheduled_date") or ""), row["id"]),
+        )
+        ids = {row["id"] for row in workouts}
+        sets = sorted((deepcopy(row) for row in self.sets.values() if row["workout_id"] in ids), key=lambda row: (row["completed_at"], row["id"]))
+        checkins = sorted((deepcopy(row) for row in self.checkins.values() if row.get("workout_id") in ids), key=lambda row: (row["created_at"], row["id"]))
+        return {"week_start": week_start, "workouts": workouts, "sets": sets, "checkins": checkins}
+
+    def approved_exercise_ids(self):
+        return {
+            key for key, value in (self.program or {}).get("exercise_library", {}).items()
+            if value.get("approved") and value.get("active", True)
+        }
+
+    def get_current_weekly_review(self, week_start):
+        rows = [row for row in self.reviews.values() if row["week_start"] == week_start]
+        return deepcopy(sorted(rows, key=lambda row: row["created_at"], reverse=True)[0]) if rows else None
+
+    def commit_weekly_review(self, operation_id, token, review):
+        for row in self.reviews.values():
+            if row["week_start"] == review["week_start"] and row["status"] == "ready":
+                row["status"] = "stale"
+        saved = {**deepcopy(review), "status": "ready", "revision": 1, "error": None, "created_at": utc_now(), "updated_at": utc_now()}
+        self.reviews[saved["id"]] = saved
+        self.commit_operation(operation_id, token, saved)
+        return deepcopy(saved)
+
+    def fail_weekly_review(self, operation_id, token, review, error):
+        saved = {**deepcopy(review), "status": "failed", "revision": 1, "result": None, "error": deepcopy(error), "created_at": utc_now(), "updated_at": utc_now()}
+        self.reviews[saved["id"]] = saved
+        self.fail_operation(operation_id, token, error)
+        return deepcopy(saved)

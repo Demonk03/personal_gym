@@ -1,5 +1,9 @@
 from uuid import uuid4
 
+from app import create_app
+from db import MemoryRepository
+from gpt import ReviewValidationError
+
 
 def checkin(**changes):
     value = {
@@ -242,3 +246,107 @@ def test_progress_rejects_invalid_period(client, auth):
     missing = client.get("/api/progress", headers=auth)
     backwards = client.get("/api/progress?from=2026-09-30&to=2026-09-01", headers=auth)
     assert missing.status_code == backwards.status_code == 400
+
+
+class FakeReviewService:
+    model = "fake-model"
+
+    def __init__(self, value):
+        self.value = value
+        self.calls = 0
+
+    def generate(self, source, approved_ids):
+        self.calls += 1
+        if isinstance(self.value, Exception):
+            raise self.value
+        return self.value
+
+
+def completed_workout(workout_id):
+    return {
+        "id": workout_id, "scheduled_date": "2026-09-07", "status": "completed",
+        "checkin_mode": "green", "checkin_reasons": [], "demo_only": True,
+        "rule_version": "demo-rules-v1", "profile_snapshot": {}, "program_snapshot": {},
+        "revision": 2, "is_extra": False, "created_at": "2026-09-07T08:00:00+00:00",
+        "updated_at": "2026-09-07T09:00:00+00:00",
+    }
+
+
+def review_result(workout_id):
+    return {
+        "summary": "Неделя сохранена.", "progress": [], "setbacks": [],
+        "symptom_observations": [], "next_week_suggestions": [],
+        "questions_for_specialist": [], "source_workout_ids": [workout_id],
+    }
+
+
+def test_weekly_review_is_idempotent_and_becomes_stale(monkeypatch, demo_program, auth):
+    monkeypatch.setenv("API_KEY", "test-key")
+    repository = MemoryRepository(demo_program)
+    workout_id = str(uuid4())
+    repository.workouts[workout_id] = completed_workout(workout_id)
+    service = FakeReviewService(review_result(workout_id))
+    client = create_app(repository=repository, weekly_review_service=service).test_client()
+    body = {"idempotency_key": str(uuid4()), "week_start": "2026-09-07"}
+
+    created = client.post("/api/weekly-reviews/generate", json=body, headers=auth)
+    repeated = client.post("/api/weekly-reviews/generate", json=body, headers=auth)
+    same_source_new_operation = client.post(
+        "/api/weekly-reviews/generate", json=operation(week_start="2026-09-07"), headers=auth,
+    )
+    current = client.get("/api/weekly-reviews/current?week_start=2026-09-07", headers=auth)
+
+    assert created.status_code == 201
+    assert repeated.status_code == 200
+    assert created.get_json() == repeated.get_json()
+    assert same_source_new_operation.get_json() == created.get_json()
+    assert service.calls == 1
+    assert current.get_json()["review"]["status"] == "ready"
+
+    repository.workouts[workout_id]["updated_at"] = "2026-09-07T10:00:00+00:00"
+    stale = client.get("/api/weekly-reviews/current?week_start=2026-09-07", headers=auth)
+    assert stale.get_json()["review"]["status"] == "stale"
+
+
+def test_invalid_ai_review_is_saved_as_failed(monkeypatch, demo_program, auth):
+    monkeypatch.setenv("API_KEY", "test-key")
+    repository = MemoryRepository(demo_program)
+    workout_id = str(uuid4())
+    repository.workouts[workout_id] = completed_workout(workout_id)
+    service = FakeReviewService(ReviewValidationError("invalid:review_keys"))
+    client = create_app(repository=repository, weekly_review_service=service).test_client()
+    body = operation(week_start="2026-09-07")
+
+    response = client.post(
+        "/api/weekly-reviews/generate",
+        json=body, headers=auth,
+    )
+    current = client.get("/api/weekly-reviews/current?week_start=2026-09-07", headers=auth)
+
+    assert response.status_code == 502
+    assert response.get_json()["error"]["code"] == "invalid_ai_response"
+    assert current.get_json()["review"]["status"] == "failed"
+
+    service.value = review_result(workout_id)
+    retried = client.post("/api/weekly-reviews/generate", json=body, headers=auth)
+    assert retried.status_code == 201
+    assert retried.get_json()["status"] == "ready"
+
+
+def test_ai_timeout_does_not_break_other_routes(monkeypatch, demo_program, auth):
+    monkeypatch.setenv("API_KEY", "test-key")
+    repository = MemoryRepository(demo_program)
+    workout_id = str(uuid4())
+    repository.workouts[workout_id] = completed_workout(workout_id)
+    client = create_app(
+        repository=repository, weekly_review_service=FakeReviewService(TimeoutError("timeout")),
+    ).test_client()
+
+    response = client.post(
+        "/api/weekly-reviews/generate", json=operation(week_start="2026-09-07"), headers=auth,
+    )
+    health = client.get("/api/health")
+    history = client.get("/api/history", headers=auth)
+
+    assert response.status_code == 503
+    assert health.status_code == history.status_code == 200

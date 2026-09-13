@@ -2,15 +2,17 @@ import hmac
 import csv
 import io
 import os
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from functools import wraps
 from typing import Any
 from uuid import NAMESPACE_URL, UUID, uuid5
+from zoneinfo import ZoneInfo
 
 from flask import Flask, Response, jsonify, request
 from werkzeug.exceptions import HTTPException
 
 import db
+import gpt
 import operations
 from metrics import build_progress
 from training import build_workout, evaluate_checkin
@@ -138,12 +140,19 @@ def _allowed_origins() -> set[str]:
 def create_app(repository=None, weekly_review_service=None) -> Flask:
     app = Flask(__name__)
     active_repository = repository
+    review_service = weekly_review_service
 
     def repo():
         nonlocal active_repository
         if active_repository is None:
             active_repository = db.SupabaseRepository()
         return active_repository
+
+    def reviews():
+        nonlocal review_service
+        if review_service is None:
+            review_service = gpt.WeeklyReviewService()
+        return review_service
 
     def require_api_key(function):
         @wraps(function)
@@ -453,6 +462,66 @@ def create_app(repository=None, weekly_review_service=None) -> Flask:
             buffer.getvalue(), content_type="text/csv; charset=utf-8",
             headers={"Content-Disposition": "attachment; filename=personal-gym-export.csv"},
         )
+
+    def requested_week_start(value=None):
+        if value:
+            try:
+                parsed = date.fromisoformat(value)
+            except ValueError:
+                raise APIError("week_start должен быть датой YYYY-MM-DD") from None
+            if parsed.isoweekday() != 1:
+                raise APIError("week_start должен быть понедельником")
+            return parsed.isoformat()
+        profile = repo().bootstrap().get("profile") or {}
+        today = datetime.now(timezone.utc).astimezone(ZoneInfo(profile.get("timezone", "Europe/Belgrade"))).date()
+        return (today - timedelta(days=today.isoweekday() - 1)).isoformat()
+
+    @app.get("/api/weekly-reviews/current")
+    @require_api_key
+    def current_weekly_review():
+        week_start = requested_week_start(request.args.get("week_start"))
+        source = repo().weekly_source(week_start)
+        review = repo().get_current_weekly_review(week_start)
+        if review and review.get("source_hash") != gpt.source_hash(source) and review.get("status") == "ready":
+            review = {**review, "status": "stale"}
+        return jsonify({"week_start": week_start, "review": review})
+
+    @app.post("/api/weekly-reviews/generate")
+    @require_api_key
+    def generate_weekly_review():
+        payload = _json()
+        operation_id = _operation(payload)
+        week_start = requested_week_start(_text(payload, "week_start", required=True, max_length=10))
+        source = repo().weekly_source(week_start)
+        source_digest = gpt.source_hash(source)
+        existing = repo().get_current_weekly_review(week_start)
+        if existing and existing.get("source_hash") == source_digest and existing.get("status") == "ready":
+            return jsonify(existing)
+        request_digest = operations.body_hash(payload)
+        review_id = str(uuid5(NAMESPACE_URL, f"personal-gym:weekly:{week_start}:{source_digest}"))
+        claim = repo().claim_operation(operation_id, "weekly_review", review_id, request_digest)
+        if claim["status"] == "conflict":
+            raise operations.OperationConflict
+        if claim["status"] == "pending":
+            raise operations.OperationPending
+        if claim["status"] == "succeeded":
+            return jsonify(claim["result"])
+        token = claim["token"]
+        base_record = {
+            "id": review_id, "week_start": week_start, "source_hash": source_digest,
+            "source_workout_ids": [row["id"] for row in source.get("workouts", [])],
+            "prompt_version": gpt.PROMPT_VERSION, "model": reviews().model,
+        }
+        try:
+            result = reviews().generate(source, repo().approved_exercise_ids())
+        except gpt.ReviewValidationError as error:
+            repo().fail_weekly_review(operation_id, token, base_record, {"code": "invalid_ai_response", "message": str(error)})
+            raise APIError("AI вернул некорректный разбор", 502, "invalid_ai_response") from error
+        except Exception as error:
+            repo().fail_weekly_review(operation_id, token, base_record, {"code": "ai_unavailable", "message": str(error)})
+            raise APIError("AI временно недоступен", 503, "ai_unavailable") from error
+        saved = repo().commit_weekly_review(operation_id, token, {**base_record, "result": result})
+        return jsonify(saved), 201
 
     return app
 

@@ -191,6 +191,9 @@ create table if not exists gym_operations (
   updated_at timestamptz not null default now()
 );
 
+create unique index if not exists one_pending_resource_operation_idx
+  on gym_operations (kind, resource_id) where status='pending' and resource_id is not null;
+
 create table if not exists push_subscriptions (
   id uuid primary key,
   endpoint text not null unique,
@@ -562,6 +565,52 @@ begin
   return jsonb_build_object('status','succeeded','result',result);
 end $$;
 
+create or replace function gym_commit_weekly_review(
+  p_operation_id uuid, p_token uuid, p_review jsonb
+) returns jsonb language plpgsql security definer set search_path = public as $$
+declare saved weekly_reviews;
+begin
+  if not exists(select 1 from gym_operations where id=p_operation_id and token=p_token and status='pending') then
+    raise exception 'operation_fenced';
+  end if;
+  insert into weekly_reviews(
+    id,week_start,source_hash,source_workout_ids,prompt_version,model,status,result,error
+  ) values (
+    (p_review->>'id')::uuid,(p_review->>'week_start')::date,p_review->>'source_hash',
+    coalesce(array(select jsonb_array_elements_text(p_review->'source_workout_ids'))::uuid[],'{}'),
+    p_review->>'prompt_version',p_review->>'model','ready',p_review->'result',null
+  ) on conflict (week_start,source_hash) do update set
+    source_workout_ids=excluded.source_workout_ids,prompt_version=excluded.prompt_version,
+    model=excluded.model,status='ready',result=excluded.result,error=null,
+    revision=weekly_reviews.revision+1,updated_at=now()
+  returning * into saved;
+  update weekly_reviews set status='stale',updated_at=now()
+  where week_start=saved.week_start and id<>saved.id and status='ready';
+  perform gym_commit_operation(p_operation_id,p_token,to_jsonb(saved));
+  return to_jsonb(saved);
+end $$;
+
+create or replace function gym_fail_weekly_review(
+  p_operation_id uuid, p_token uuid, p_review jsonb, p_error jsonb
+) returns jsonb language plpgsql security definer set search_path = public as $$
+declare saved weekly_reviews;
+begin
+  if not exists(select 1 from gym_operations where id=p_operation_id and token=p_token and status='pending') then
+    raise exception 'operation_fenced';
+  end if;
+  insert into weekly_reviews(
+    id,week_start,source_hash,source_workout_ids,prompt_version,model,status,result,error
+  ) values (
+    (p_review->>'id')::uuid,(p_review->>'week_start')::date,p_review->>'source_hash',
+    coalesce(array(select jsonb_array_elements_text(p_review->'source_workout_ids'))::uuid[],'{}'),
+    p_review->>'prompt_version',p_review->>'model','failed',null,p_error
+  ) on conflict (week_start,source_hash) do update set
+    status='failed',result=null,error=excluded.error,revision=weekly_reviews.revision+1,updated_at=now()
+  returning * into saved;
+  perform gym_fail_operation(p_operation_id,p_token,p_error);
+  return to_jsonb(saved);
+end $$;
+
 alter table player_profile enable row level security;
 alter table exercise_library enable row level security;
 alter table exercise_replacements enable row level security;
@@ -594,5 +643,7 @@ revoke all on function gym_save_next_day_checkin(uuid,text,uuid,integer,jsonb) f
 revoke all on function gym_update_set(uuid,text,uuid,integer,uuid,integer,jsonb) from public;
 revoke all on function gym_create_weight(uuid,text,jsonb) from public;
 revoke all on function gym_update_weight(uuid,text,uuid,integer,numeric,timestamptz) from public;
+revoke all on function gym_commit_weekly_review(uuid,uuid,jsonb) from public;
+revoke all on function gym_fail_weekly_review(uuid,uuid,jsonb,jsonb) from public;
 
 commit;
