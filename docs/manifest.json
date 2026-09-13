@@ -1,0 +1,10 @@
+{
+  "name": "Personal Gym",
+  "short_name": "Gym",
+  "description": "Персональный журнал тренировок",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait"
+}
+

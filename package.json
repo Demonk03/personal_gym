@@ -1,0 +1,11 @@
+{
+  "private": true,
+  "description": "Development checks for Personal Gym",
+  "scripts": {
+    "test": "node --test tests/schema.test.cjs"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "0.5.8"
+  }
+}
+
