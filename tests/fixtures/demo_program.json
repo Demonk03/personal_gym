@@ -1,0 +1,23 @@
+{
+  "id": "10000000-0000-4000-8000-000000000001",
+  "session_id": "20000000-0000-4000-8000-000000000002",
+  "version": 1,
+  "rule_version": "demo-rules-v1",
+  "demo_only": true,
+  "rules": {
+    "version": "demo-rules-v1",
+    "demo_only": true,
+    "yellow": {"pain_at_least": 7, "readiness_at_most": 2}
+  },
+  "exercise_library": {
+    "bird-dog": {"name": "Bird dog", "equipment": ["mat"], "measurement_type": "reps", "demo_only": true},
+    "band-row": {"name": "Тяга резинки сидя", "equipment": ["bands"], "measurement_type": "reps", "demo_only": true},
+    "bike-easy": {"name": "Велотренажёр", "equipment": ["stationary_bike"], "measurement_type": "seconds", "demo_only": true},
+    "walk-easy": {"name": "Спокойная ходьба", "equipment": [], "measurement_type": "seconds", "demo_only": true}
+  },
+  "exercises": [
+    {"exercise_id": "bird-dog", "planned_sets": 3, "planned_reps": 6, "planned_seconds": null, "planned_weight_kg": null, "yellow_factor": 0.67, "allowed_replacements": []},
+    {"exercise_id": "band-row", "planned_sets": 3, "planned_reps": 12, "planned_seconds": null, "planned_weight_kg": null, "yellow_factor": 0.67, "allowed_replacements": []},
+    {"exercise_id": "bike-easy", "planned_sets": 1, "planned_reps": null, "planned_seconds": 1200, "planned_weight_kg": null, "yellow_factor": 0.6, "allowed_replacements": ["walk-easy"]}
+  ]
+}
