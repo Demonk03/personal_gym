@@ -1,7 +1,5 @@
 # Personal Gym delivery status
 
-Detailed plan: [MVP implementation plan](superpowers/plans/2026-09-13-personal-gym-mvp.md).
-
 | Task | Status | Notes |
 |---|---|---|
 | 1. Backend scaffold | Complete | Visual frontend shell deferred until design handoff |

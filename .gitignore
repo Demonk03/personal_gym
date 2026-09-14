@@ -11,3 +11,9 @@ coverage/
 exports/
 backups/
 dist/
+
+# Private product and health context. Keep these local only.
+SPEC.md
+docs/design/
+docs/superpowers/
+docs/design_handoff_personal_gym/
