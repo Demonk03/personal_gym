@@ -243,6 +243,8 @@ def create_app(repository=None, weekly_review_service=None) -> Flask:
         if evaluation["blocks_workout"]:
             result = repo().save_blocked_checkin(operation_id, request_hash, checkin, evaluation)
             return jsonify(result)
+        if not isinstance(payload.get("is_extra", False), bool):
+            raise APIError("is_extra должно быть true или false")
         plan = build_workout(program, evaluation, checkin["equipment"])
         workout_id = str(uuid5(NAMESPACE_URL, f"personal-gym:{operation_id}:workout"))
         exercises = []
@@ -251,11 +253,12 @@ def create_app(repository=None, weekly_review_service=None) -> Flask:
         workout = {
             "id": workout_id, "program_version_id": plan["program_version_id"],
             "program_session_id": plan["program_session_id"],
-            "scheduled_date": _date(payload, "scheduled_date"),
+            "scheduled_date": _date(payload, "scheduled_date") or datetime.now(ZoneInfo((repo().bootstrap().get("profile") or {}).get("timezone", "Europe/Belgrade"))).date().isoformat(),
+            "is_extra": payload.get("is_extra", False), "omitted": plan["omitted"],
             "status": "preparing", "checkin_mode": evaluation["mode"],
             "checkin_reasons": evaluation["reasons"], "demo_only": plan["demo_only"],
             "rule_version": plan["rule_version"], "profile_snapshot": repo().bootstrap().get("profile") or {},
-            "program_snapshot": plan["source_snapshot"], "checkin_payload": checkin,
+            "program_snapshot": {**plan["source_snapshot"], "omitted": plan["omitted"]}, "checkin_payload": checkin,
             "checkin_evaluation": evaluation, "revision": 1,
             "created_at": datetime.now(timezone.utc).isoformat(), "updated_at": datetime.now(timezone.utc).isoformat(),
         }
@@ -303,6 +306,7 @@ def create_app(repository=None, weekly_review_service=None) -> Flask:
             "id": _uuid(payload.get("id"), "id"), "workout_id": _uuid(workout_id, "workout_id"),
             "workout_exercise_id": _uuid(payload.get("workout_exercise_id"), "workout_exercise_id"),
             "set_number": _integer(payload, "set_number", 1, 50),
+            "completed_at": _timestamp(payload,"completed_at") if payload.get("completed_at") else datetime.now(timezone.utc).isoformat(),
             "actual_reps": _optional_integer(payload, "actual_reps", 0, 1000),
             "actual_seconds": _optional_integer(payload, "actual_seconds", 0, 7200),
             "actual_weight_kg": _number(payload, "actual_weight_kg", 0, 400),
@@ -348,7 +352,7 @@ def create_app(repository=None, weekly_review_service=None) -> Flask:
         result = repo().finish_workout(
             operation_id, digest, _uuid(workout_id, "workout_id"),
             _integer(payload, "revision", 1, 1_000_000), status,
-            _text(payload, "finished_at", max_length=50) or datetime.now(timezone.utc).isoformat(),
+            _timestamp(payload, "finished_at") if payload.get("finished_at") else datetime.now(timezone.utc).isoformat(),
             stop_reason, _post_checkin(payload.get("post_checkin")),
         )
         return jsonify(result)
@@ -448,6 +452,7 @@ def create_app(repository=None, weekly_review_service=None) -> Flask:
         fields = [
             "record_type", "id", "measured_at", "weight_kg", "workout_id",
             "workout_exercise_id", "set_number", "actual_reps", "actual_seconds", "actual_weight_kg",
+            "waist_cm", "chest_cm", "hips_cm", "thigh_cm",
         ]
         writer = csv.DictWriter(buffer, fieldnames=fields)
         writer.writeheader()
@@ -456,6 +461,8 @@ def create_app(repository=None, weekly_review_service=None) -> Flask:
                 "record_type": "weight", "id": item.get("id"),
                 "measured_at": item.get("measured_at"), "weight_kg": item.get("weight_kg"),
             })
+        for item in data.get("body_measurements", []):
+            writer.writerow({key: value for key, value in {"record_type": "measurement", **item}.items() if key in fields})
         for item in data.get("workout_sets", []):
             writer.writerow({key: value for key, value in {"record_type": "set", **item}.items() if key in fields})
         return Response(
@@ -484,7 +491,13 @@ def create_app(repository=None, weekly_review_service=None) -> Flask:
         review = repo().get_current_weekly_review(week_start)
         if review and review.get("source_hash") != gpt.source_hash(source) and review.get("status") == "ready":
             review = {**review, "status": "stale"}
-        return jsonify({"week_start": week_start, "review": review})
+        profile = repo().bootstrap().get("profile") or {}
+        end = (date.fromisoformat(week_start) + timedelta(days=6)).isoformat()
+        facts = build_progress(repo().progress_data(week_start, end), profile.get("timezone", "Europe/Belgrade"), profile.get("target_weight_kg"))
+        completed = {w["id"] for w in source.get("workouts", []) if w["status"] in {"completed", "stopped_early"}}
+        answered = {c.get("workout_id") for c in source.get("checkins", []) if c["kind"] == "next_day"}
+        return jsonify({"week_start": week_start, "review": review, "facts": facts,
+            "coverage": {"workouts": len(completed), "next_day_missing": len(completed - answered)}, "no_data": not completed})
 
     @app.post("/api/weekly-reviews/generate")
     @require_api_key
@@ -523,6 +536,10 @@ def create_app(repository=None, weekly_review_service=None) -> Flask:
         saved = repo().commit_weekly_review(operation_id, token, {**base_record, "result": result})
         return jsonify(saved), 201
 
+    from integration import register_integration
+    register_integration(app, repo, require_api_key)
+    from notifications import register_notifications
+    register_notifications(app, repo, require_api_key)
     return app
 
 

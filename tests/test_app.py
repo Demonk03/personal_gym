@@ -168,6 +168,16 @@ def test_full_workout_lifecycle_and_stale_revision(client, auth, repository):
     assert saved.status_code == repeated.status_code == 201
     assert saved.get_json() == repeated.get_json()
 
+    # A completed session now requires all planned sets, not only one logged set.
+    for entry in replaced.get_json()["exercises"]:
+        for number in range(1, entry["planned_sets"] + 1):
+            if entry["id"] == first_exercise["id"] and number == 1:
+                continue
+            assert client.post(f"/api/workouts/{workout_id}/sets", json=operation(
+                id=str(uuid4()), workout_exercise_id=entry["id"], set_number=number,
+                **({"actual_seconds": entry["planned_seconds"]} if entry.get("planned_seconds") else {"actual_reps": entry["planned_reps"]})
+            ), headers=auth).status_code == 201
+
     finished = client.post(
         f"/api/workouts/{workout_id}/finish",
         json=operation(

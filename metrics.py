@@ -63,6 +63,7 @@ def training_summary(
     sets: list[dict[str, Any]],
     planned_session_dates: list[str],
 ) -> dict[str, Any]:
+    workouts = [w for w in workouts if w.get("checkin_mode") != "red"]
     planned = set(planned_session_dates)
     completed = [row for row in workouts if row.get("status") == "completed"]
     completed_planned = [
@@ -103,7 +104,7 @@ def symptom_series(checkins: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "workout_id": row.get("workout_id"), "kind": row.get("kind"),
             "created_at": row.get("created_at"), "back_pain": payload.get("back_pain"),
             "pain_change": payload.get("pain_change"),
-            "leg_symptoms_change": payload.get("leg_symptoms_change"),
+            "leg_symptoms_change": payload.get("leg_symptoms_change") or (payload.get("leg_symptoms") or {}).get("trend"),
         })
     return result
 

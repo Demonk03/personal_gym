@@ -112,7 +112,7 @@ test("workout, set, and finish RPCs are idempotent and revision-safe", async () 
     original_exercise_id: "incline-pushup",
     exercise_id: "incline-pushup",
     position: 1,
-    planned_sets: 3,
+    planned_sets: 1,
     planned_reps: 6,
   }]);
   const createArgs = [
@@ -218,4 +218,47 @@ test("weekly review and operation result commit in one database call", async () 
   assert.equal(operation.rows[0].status, "succeeded");
   assert.equal(operation.rows[0].result.status, "ready");
   await db.close();
+});
+
+test('handoff RPCs preserve extra flag and replacement reasons, edit plan, undo sets and measure idempotently',async()=>{
+ const db=await database();await db.exec(seed);
+ const wid='40000000-0000-4000-8000-000000000099',eid='41000000-0000-4000-8000-000000000099';
+ const {randomUUID}=require('node:crypto');
+ const snapshot={rules:{version:'demo-rules-v1'},exercise_library:{'incline-pushup':{measurement_type:'reps'},'wall-pushup':{measurement_type:'reps'}},exercises:[{exercise_id:'incline-pushup',allowed_replacements:['wall-pushup']}]};
+ const workout={id:wid,scheduled_date:'2026-09-13',is_extra:true,checkin_mode:'green',rule_version:'demo-rules-v1',program_snapshot:snapshot,checkin_payload:{equipment:[]},checkin_evaluation:{mode:'green'}};
+ const exercises=[{id:eid,original_exercise_id:'incline-pushup',exercise_id:'wall-pushup',position:1,planned_sets:1,planned_reps:6,replacement_reason:'equipment_unavailable'}];
+ await db.query('select gym_create_prepared_workout($1,$2,$3,$4)',[randomUUID(),'prepare',JSON.stringify(workout),JSON.stringify(exercises)]);
+ assert.equal((await db.query('select is_extra from workouts where id=$1',[wid])).rows[0].is_extra,true);
+ assert.equal((await db.query('select replacement_reason from workout_exercises where id=$1',[eid])).rows[0].replacement_reason,'equipment_unavailable');
+ const edit=async(rev,action,data,op=randomUUID())=>(await db.query('select gym_edit($1,$2,$3,$4,$5,$6) as value',[op,action,wid,rev,action,JSON.stringify(data)])).rows[0].value;
+ const op=randomUUID();await edit(1,'remove',{entry_id:eid},op);await edit(1,'remove',{entry_id:eid},op);
+ assert.equal((await db.query('select revision from workouts where id=$1',[wid])).rows[0].revision,2);
+ await assert.rejects(db.query('select gym_start_workout($1,$2,$3,2)',[randomUUID(),'start',wid]));
+ await edit(2,'restore',{entry_id:eid});
+ await db.query('select gym_start_workout($1,$2,$3,3)',[randomUUID(),'start',wid]);
+ const sid=randomUUID(),set={id:sid,workout_id:wid,workout_exercise_id:eid,set_number:1,actual_reps:6};
+ await db.query('select gym_save_set($1,$2,$3)',[randomUUID(),'set',JSON.stringify(set)]);
+ await assert.rejects(edit(4,'remove',{entry_id:eid}));
+ await assert.rejects(db.query('select gym_replace_workout_exercise($1,$2,$3,4,$4,$5)',[randomUUID(),'replace',wid,eid,'wall-pushup']));
+ await edit(4,'undo_set',{set_id:sid,set_revision:1});
+ assert.equal((await db.query('select count(*)::int n from workout_sets')).rows[0].n,0);
+ await edit(5,'skip',{entry_id:eid});
+ await assert.rejects(db.query('select gym_save_set($1,$2,$3)',[randomUUID(),'set-again',JSON.stringify({...set,id:randomUUID()})]));
+ const mid=randomUUID(),data={measured_at:'2026-09-13T10:00:00Z',waist_cm:96,chest_cm:104,hips_cm:103,thigh_cm:60};
+ for(let i=0;i<2;i++)await db.query('select gym_measurement($1,$2,$3)',[mid,'measure',JSON.stringify(data)]);
+ assert.equal((await db.query('select count(*)::int n from body_measurements')).rows[0].n,1);
+ const claim=await db.query("select gym_claim_notification('test-key','next_day_checkin') as value");
+ assert.equal(claim.rows[0].value.claimed,true);
+ assert.equal((await db.query("select gym_claim_notification('test-key','next_day_checkin') as value")).rows[0].value.claimed,false);
+ await db.close();
+});
+
+test('reprepare is atomic, preserves workout ID and red evaluation survives reload',async()=>{
+ const db=await database();await db.exec(seed);const {randomUUID}=require('node:crypto');const wid=randomUUID(),eid=randomUUID();
+ await db.query('select gym_create_prepared_workout($1,$2,$3,$4)',[randomUUID(),'create',JSON.stringify({id:wid,checkin_mode:'green',rule_version:'demo-rules-v1',program_snapshot:{},checkin_payload:{},checkin_evaluation:{mode:'green'}}),JSON.stringify([{id:eid,original_exercise_id:'bird-dog',exercise_id:'bird-dog',position:1,planned_sets:3,planned_reps:6}])]);
+ const payload={evaluation:{mode:'red',reasons:['red:fainting'],blocks_workout:true},snapshot:{},checkin:{systemic_symptoms:{fainting:true}},exercises:[]};
+ await db.query("select gym_edit($1,'red',$2,1,'reprepare',$3)",[randomUUID(),wid,JSON.stringify(payload)]);
+ const workouts=(await db.query('select * from workouts')).rows;assert.equal(workouts.length,1);assert.equal(workouts[0].status,'cancelled');assert.equal(workouts[0].checkin_mode,'red');
+ assert.equal((await db.query('select evaluation from checkins where workout_id=$1',[wid])).rows[0].evaluation.blocks_workout,true);
+ await db.close();
 });

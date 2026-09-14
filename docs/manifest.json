@@ -1,10 +1,1 @@
-{
-  "name": "Personal Gym",
-  "short_name": "Gym",
-  "description": "Персональный журнал тренировок",
-  "start_url": "./",
-  "scope": "./",
-  "display": "standalone",
-  "orientation": "portrait"
-}
-
+{"name":"Personal Gym","short_name":"Gym","lang":"ru","start_url":"./","scope":"./","display":"standalone","background_color":"#F2F3F5","theme_color":"#F2F3F5","icons":[{"src":"icon.svg","sizes":"any","type":"image/svg+xml","purpose":"any"}]}
