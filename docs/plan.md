@@ -11,6 +11,7 @@
 | 7–10. PWA and design integration | Implemented locally | Handoff screens, durable queue, history and measurements; browser walkthrough verified |
 | 11. Push and worker | Implemented; deployment required | Subscription API, neutral delivery, durable claims; fake-delivery tests only |
 | 12. Cloud release | Pending | Apply schema, configure hosting/VAPID and verify real iPhone installation/push |
+| Exercise library and quick entry | Implemented locally | 87 cards, manual statuses, immutable workout snapshots, four fact formats and offline-dependent quick entry; production migration pending |
 | Backlog: progress gamification | Idea | Active days, schedule streaks, personal records and milestones; definitions require a separate design |
 
 Design integration decisions: [API contract](api-integration.md). Original gaps: [audit](design-backend-gap-analysis.md).

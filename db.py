@@ -11,6 +11,23 @@ from uuid import uuid4
 from operations import execute_operation
 
 
+MEASUREMENT_TYPES = {"reps", "seconds", "weighted_reps", "reps_seconds"}
+REVIEW_STATUSES = {"allowed", "conditional", "needs_review", "blocked"}
+
+
+def validate_set_fact(measurement_type: str, values: dict[str, Any]) -> None:
+    """Validate facts against the immutable definition selected for this workout."""
+    reps, seconds, weight = (values.get("actual_reps"), values.get("actual_seconds"), values.get("actual_weight_kg"))
+    valid = {
+        "reps": reps is not None and reps > 0 and seconds is None and weight is None,
+        "seconds": reps is None and seconds is not None and seconds > 0 and weight is None,
+        "weighted_reps": reps is not None and reps > 0 and seconds is None and weight is not None and weight >= 0,
+        "reps_seconds": reps is not None and reps > 0 and seconds is not None and seconds > 0 and weight is None,
+    }
+    if measurement_type not in MEASUREMENT_TYPES or not valid.get(measurement_type, False):
+        raise Conflict("measurement_mismatch")
+
+
 class RepositoryError(Exception):
     code = "repository_error"
 
@@ -56,10 +73,36 @@ class SupabaseRepository:
 
     def bootstrap(self) -> dict[str, Any]:
         profile = self.client.table("player_profile").select("*").eq("id", True).limit(1).execute().data
-        program = self.get_program()
+        try:
+            program = self.get_program()
+        except NotFound:
+            return {"contract_version": 1, "profile": profile[0] if profile else None, "program": None, "sessions": []}
         sessions = self.client.table("program_sessions").select("session_key").eq("program_version_id", program["id"]).order("position").execute().data
         return {"contract_version": 1, "profile": profile[0] if profile else None, "program": program,
                 "sessions": [self.get_program(row["session_key"]) for row in sessions]}
+
+    def list_exercises(self, query=""):
+        request = self.client.table("exercise_library").select("*").eq("active", True).order("name")
+        if query:
+            request = request.ilike("name", f"%{query}%")
+        return request.limit(200).execute().data
+
+    def update_exercise(self, exercise_id, revision, changes):
+        payload = {**changes, "revision": revision + 1, "updated_at": utc_now()}
+        rows = self.client.table("exercise_library").update(payload).eq("id", exercise_id).eq("revision", revision).execute().data
+        if rows:
+            return rows[0]
+        if not self.client.table("exercise_library").select("id").eq("id", exercise_id).limit(1).execute().data:
+            raise NotFound("exercise_not_found")
+        raise RevisionConflict("revision_conflict")
+
+    def add_workout_exercise(self, operation_id, payload_hash, workout_id, revision, entry_id, exercise):
+        result = self._rpc("gym_add_workout_exercise", {
+            "p_operation_id": operation_id, "p_body_hash": payload_hash,
+            "p_workout_id": workout_id, "p_revision": revision,
+            "p_entry_id": entry_id, "p_exercise": exercise,
+        })
+        return self.get_workout(result["workout_id"])
 
     def get_program(self, session_key: str | None = None) -> dict[str, Any]:
         versions = self.client.table("program_versions").select("*").eq("active", True).limit(1).execute().data
@@ -150,6 +193,7 @@ class SupabaseRepository:
             if any(code in message for code in (
                 "active_workout_exists", "invalid_workout_state", "invalid_exercise_order",
                 "replacement_not_allowed", "checkin_already_exists", "set_already_exists", "exercise_has_sets", "exercise_unavailable", "empty_plan", "invalid_edit", "incomplete_workout",
+                "measurement_mismatch", "workout_exercise_exists", "program_has_unapproved_exercises",
             )):
                 raise Conflict(message) from error
             if "not_found" in message:
@@ -188,6 +232,11 @@ class SupabaseRepository:
         return self.get_workout(result["workout_id"]) if result.get("workout_id") else result
 
     def save_set(self, operation_id, payload_hash, set_data):
+        bundle = self.get_workout(set_data["workout_id"])
+        entry = next((row for row in bundle["exercises"] if row["id"] == set_data["workout_exercise_id"]), None)
+        if not entry:
+            raise NotFound("workout_exercise_not_found")
+        validate_set_fact((entry.get("definition_snapshot") or {}).get("measurement_type"), set_data)
         return self._rpc("gym_save_set", {"p_operation_id": operation_id, "p_body_hash": payload_hash, "p_set": set_data})
 
     def finish_workout(self, operation_id, payload_hash, workout_id, revision, status, finished_at, stop_reason, post_checkin):
@@ -241,8 +290,9 @@ class SupabaseRepository:
         snapshots = {row["id"]: row.get("program_snapshot", {}).get("exercise_library", {}) for row in workouts}
         for item in sets:
             entry = entry_map.get(item["workout_exercise_id"], {})
-            definition = snapshots.get(entry.get("workout_id"), {}).get(entry.get("exercise_id"), {})
-            if float(item.get("actual_weight_kg") or 0) > 0:
+            definition = entry.get("definition_snapshot") or snapshots.get(entry.get("workout_id"), {}).get(entry.get("exercise_id"), {})
+            item["measurement_type"] = definition.get("measurement_type")
+            if definition.get("measurement_type") == "weighted_reps":
                 item["load_category"] = "external_weight"
             elif "bands" in definition.get("equipment", []):
                 item["load_category"] = "band"
@@ -281,7 +331,7 @@ class SupabaseRepository:
         return {"week_start": week_start, "workouts": workouts, "sets": sets, "checkins": checkins}
 
     def approved_exercise_ids(self):
-        rows = self.client.table("exercise_library").select("id").eq("approved", True).eq("active", True).execute().data
+        rows = self.client.table("exercise_library").select("id").eq("review_status", "allowed").eq("active", True).execute().data
         return {row["id"] for row in rows}
 
     def get_current_weekly_review(self, week_start):
@@ -320,6 +370,28 @@ class MemoryRepository:
         self.measurements = {}
         self.edits = []
         self.reviews: dict[str, dict[str, Any]] = {}
+        self.catalog: dict[str, dict[str, Any]] = deepcopy((program or {}).get("exercise_library", {}))
+        for exercise_id, item in self.catalog.items():
+            item.setdefault("id", exercise_id)
+            item.setdefault("review_status", "needs_review")
+            item.setdefault("active", True)
+            item.setdefault("note", "")
+            item.setdefault("source", "base_catalog")
+            item.setdefault("revision", 1)
+
+    def list_exercises(self, query=""):
+        needle = query.casefold().strip()
+        return sorted((deepcopy(row) for row in self.catalog.values() if row.get("active", True) and needle in row["name"].casefold()), key=lambda row: row["name"].casefold())
+
+    def update_exercise(self, exercise_id, revision, changes):
+        row = self.catalog.get(exercise_id)
+        if not row:
+            raise NotFound("exercise_not_found")
+        if row["revision"] != revision:
+            raise RevisionConflict("revision_conflict")
+        row.update(deepcopy(changes), revision=revision + 1, updated_at=utc_now())
+        row["approved"] = bool(row.get("active", True) and row.get("review_status") == "allowed")
+        return deepcopy(row)
 
     def bootstrap(self):
         return {"contract_version": 1, "profile": deepcopy(self.profile), "program": deepcopy(self.program), "sessions": [deepcopy(self.program)] if self.program else []}
@@ -458,12 +530,18 @@ class MemoryRepository:
                 if any(r["workout_exercise_id"] == entry["id"] for r in self.sets.values()):
                     raise Conflict("exercise_has_sets")
                 definition = allowed[params["p_replacement_id"]]
+                if not definition.get("active", True) or definition.get("review_status") != "allowed":
+                    raise Conflict("replacement_not_allowed")
                 equipment = next((r["payload"]["equipment"] for r in self.checkins.values() if r.get("workout_id") == workout_id and r["kind"] == "pre"), [])
                 if not set(definition.get("equipment", [])).issubset(equipment):
                     raise Conflict("exercise_unavailable")
                 if definition.get("measurement_type") != allowed[entry["exercise_id"]].get("measurement_type"):
                     raise Conflict("exercise_unavailable")
-                entry.update(exercise_id=params["p_replacement_id"], replacement_reason=params.get("p_reason"), revision=entry["revision"] + 1)
+                entry.update(
+                    exercise_id=params["p_replacement_id"], replacement_reason=params.get("p_reason"),
+                    definition_snapshot={key: deepcopy(definition.get(key, "")) for key in ("id", "name", "measurement_type", "note")},
+                    revision=entry["revision"] + 1,
+                )
             elif action == "next_day_checkin":
                 if workout["status"] not in {"completed", "stopped_early"}:
                     raise Conflict("invalid_workout_state")
@@ -481,6 +559,8 @@ class MemoryRepository:
                     raise NotFound("set_not_found")
                 if item["revision"] != params["p_set_revision"]:
                     raise RevisionConflict("revision_conflict")
+                entry = self.exercises[item["workout_exercise_id"]]
+                validate_set_fact((entry.get("definition_snapshot") or {}).get("measurement_type"), {**item, **params["p_set_data"]})
                 item.update(**deepcopy(params["p_set_data"]), revision=item["revision"] + 1)
                 workout["edited_at"] = utc_now()
                 self.edits.append({"workout_id": workout_id, "action": "update_set", "created_at": utc_now()})
@@ -491,6 +571,46 @@ class MemoryRepository:
                 workout["updated_at"] = utc_now()
             return self.get_workout(workout_id)
         return execute_operation(self, operation_id, action, workout_id, payload, mutate, payload_hash)
+
+    def add_workout_exercise(self, operation_id, payload_hash, workout_id, revision, entry_id, exercise):
+        payload = {"workout_id": workout_id, "revision": revision, "entry_id": entry_id, "exercise": exercise}
+        def add():
+            workout = self.workouts.get(workout_id)
+            if not workout:
+                raise NotFound("workout_not_found")
+            if workout["status"] not in {"preparing", "in_progress"}:
+                raise Conflict("invalid_workout_state")
+            if workout["revision"] != revision:
+                raise RevisionConflict("revision_conflict")
+            exercise_id = exercise["id"]
+            existing = self.catalog.get(exercise_id)
+            if existing:
+                if not existing.get("active", True) or existing.get("review_status") == "blocked":
+                    raise Conflict("exercise_unavailable")
+                definition = existing
+            else:
+                if not exercise_id.startswith("custom-"):
+                    raise NotFound("exercise_not_found")
+                definition = {
+                    **deepcopy(exercise), "instructions": "", "media_url": None, "equipment": [],
+                    "source": "quick_user_entry", "review_status": "needs_review", "active": True,
+                    "approved": False, "demo_only": False, "revision": 1,
+                }
+                self.catalog[exercise_id] = definition
+            if entry_id in self.exercises:
+                raise Conflict("workout_exercise_exists")
+            position = max((row["position"] for row in self.exercises.values() if row["workout_id"] == workout_id), default=0) + 1
+            self.exercises[entry_id] = {
+                "id": entry_id, "workout_id": workout_id, "original_exercise_id": exercise_id,
+                "exercise_id": exercise_id, "position": position, "planned_sets": None,
+                "planned_reps": None, "planned_seconds": None, "planned_weight_kg": None,
+                "definition_snapshot": {key: deepcopy(definition.get(key, "")) for key in ("id", "name", "measurement_type", "note")},
+                "is_ad_hoc": True, "replacement_reason": None, "revision": 1,
+                "skipped": False, "removed": False,
+            }
+            workout.update(revision=revision + 1, updated_at=utc_now())
+            return self.get_workout(workout_id)
+        return execute_operation(self, operation_id, "add_workout_exercise", workout_id, payload, add, payload_hash)
 
     def save_set(self, operation_id, payload_hash, set_data):
         workout_id = set_data["workout_id"]
@@ -503,6 +623,7 @@ class MemoryRepository:
                 raise NotFound("workout_exercise_not_found")
             if entry.get("removed") or entry.get("skipped"):
                 raise Conflict("exercise_unavailable")
+            validate_set_fact((entry.get("definition_snapshot") or {}).get("measurement_type"), set_data)
             if set_data["id"] in self.sets or any(
                 row["workout_exercise_id"] == entry["id"] and row["set_number"] == set_data["set_number"]
                 for row in self.sets.values()
@@ -522,7 +643,7 @@ class MemoryRepository:
                 raise Conflict("invalid_workout_state")
             if workout["revision"] != revision:
                 raise RevisionConflict("revision_conflict")
-            if status == "completed" and any(e.get("skipped") or sum(s["workout_exercise_id"] == e["id"] for s in self.sets.values()) < e["planned_sets"] for e in self.exercises.values() if e["workout_id"] == workout_id and not e.get("removed")):
+            if status == "completed" and any(e.get("skipped") or sum(s["workout_exercise_id"] == e["id"] for s in self.sets.values()) < e["planned_sets"] for e in self.exercises.values() if e["workout_id"] == workout_id and not e.get("removed") and not e.get("is_ad_hoc")):
                 raise Conflict("incomplete_workout")
             workout.update(status=status, finished_at=finished_at, stop_reason=stop_reason, revision=revision + 1, updated_at=utc_now())
             checkin_id = str(uuid4())
@@ -551,8 +672,9 @@ class MemoryRepository:
                 continue
             item = deepcopy(row)
             entry = self.exercises[item["workout_exercise_id"]]
-            definition = self.workouts[row["workout_id"]]["program_snapshot"].get("exercise_library", {}).get(entry["exercise_id"], {})
-            if float(item.get("actual_weight_kg") or 0) > 0:
+            definition = entry.get("definition_snapshot") or self.workouts[row["workout_id"]]["program_snapshot"].get("exercise_library", {}).get(entry["exercise_id"], {})
+            item["measurement_type"] = definition.get("measurement_type")
+            if definition.get("measurement_type") == "weighted_reps":
                 item["load_category"] = "external_weight"
             elif "bands" in definition.get("equipment", []):
                 item["load_category"] = "band"
@@ -598,7 +720,7 @@ class MemoryRepository:
     def export_data(self):
         return {
             "player_profile": [deepcopy(self.profile)],
-            "exercise_library": list(deepcopy((self.program or {}).get("exercise_library", {})).values()),
+            "exercise_library": list(deepcopy(self.catalog).values()),
             "exercise_replacements": [],
             "program_versions": [deepcopy(self.program)] if self.program else [],
             "program_sessions": [], "program_session_exercises": [],
@@ -626,8 +748,8 @@ class MemoryRepository:
 
     def approved_exercise_ids(self):
         return {
-            key for key, value in (self.program or {}).get("exercise_library", {}).items()
-            if value.get("approved") and value.get("active", True)
+            key for key, value in self.catalog.items()
+            if value.get("review_status") == "allowed" and value.get("active", True)
         }
 
     def get_current_weekly_review(self, week_start):

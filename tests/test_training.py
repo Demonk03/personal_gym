@@ -101,3 +101,16 @@ def test_build_rejects_unknown_exercise(program):
     program["exercises"][0]["exercise_id"] = "missing"
     with pytest.raises(ValueError, match="unknown_exercise"):
         build_workout(program, result, ["mat"])
+
+
+def test_build_rejects_non_allowed_program_entry_and_skips_non_allowed_replacement(program):
+    result = evaluate_checkin(base_checkin(), program["rules"])
+    program["exercise_library"]["bird-dog"]["review_status"] = "needs_review"
+    with pytest.raises(ValueError, match="exercise_not_allowed:bird-dog"):
+        build_workout(program, result, ["mat"])
+
+    program["exercise_library"]["bird-dog"]["review_status"] = "allowed"
+    program["exercise_library"]["walk-easy"]["review_status"] = "blocked"
+    workout = build_workout(program, result, ["mat", "bands"])
+    assert [item["exercise_id"] for item in workout["exercises"]] == ["bird-dog", "band-row"]
+    assert workout["exercises"][0]["definition_snapshot"]["name"] == "Bird dog"

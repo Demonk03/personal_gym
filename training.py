@@ -1,4 +1,4 @@
-"""Deterministic demo check-in evaluation and workout construction."""
+"""Deterministic check-in evaluation and workout construction."""
 
 from __future__ import annotations
 
@@ -121,6 +121,20 @@ def _available(exercise: dict[str, Any], equipment: set[str]) -> bool:
     return set(exercise.get("equipment", [])).issubset(equipment)
 
 
+def is_program_eligible(exercise: dict[str, Any]) -> bool:
+    """Only manually allowed, active cards may be selected by a program."""
+    return bool(exercise.get("active", True)) and exercise.get("review_status") == "allowed"
+
+
+def definition_snapshot(exercise_id: str, exercise: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": exercise_id,
+        "name": exercise["name"],
+        "measurement_type": exercise["measurement_type"],
+        "note": exercise.get("note", ""),
+    }
+
+
 def _yellow_value(value: Any, factor: float) -> Any:
     return None if value is None else max(1, floor(value * factor))
 
@@ -144,12 +158,14 @@ def build_workout(program: dict[str, Any], checkin_result: dict[str, Any], equip
         definition = library.get(original_id)
         if not definition:
             raise ValueError(f"unknown_exercise:{original_id}")
+        if not is_program_eligible(definition):
+            raise ValueError(f"exercise_not_allowed:{original_id}")
         replacement_reason = None
         if not _available(definition, allowed_equipment):
             selected_id = ""
             for candidate_id in item.get("allowed_replacements", []):
                 candidate = library.get(candidate_id)
-                if candidate and _available(candidate, allowed_equipment):
+                if candidate and is_program_eligible(candidate) and _available(candidate, allowed_equipment):
                     selected_id = candidate_id
                     definition = candidate
                     replacement_reason = "equipment_unavailable"
@@ -167,6 +183,8 @@ def build_workout(program: dict[str, Any], checkin_result: dict[str, Any], equip
             "planned_weight_kg": item.get("planned_weight_kg"),
             "replacement_reason": replacement_reason,
             "demo_only": bool(definition.get("demo_only", True)),
+            "definition_snapshot": definition_snapshot(selected_id, definition),
+            "is_ad_hoc": False,
         })
     return {
         "program_version": program["version"], "program_version_id": program.get("id"),

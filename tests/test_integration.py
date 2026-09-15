@@ -66,3 +66,42 @@ def test_incomplete_session_must_finish_early(client,auth):
     assert post(client,auth,f'/api/workouts/{wid}/finish',body).status_code==409
     body.update(status='stopped_early',stop_reason='Нет времени')
     assert post(client,auth,f'/api/workouts/{wid}/finish',body).status_code==200
+
+
+def test_exercise_library_snapshot_survives_live_edit_and_ad_hoc_does_not_block_finish(client,auth):
+    b=prepared(client,auth);wid=b['workout']['id']
+    started=post(client,auth,f'/api/workouts/{wid}/start',{'revision':1}).json
+    exercise_id=f'custom-{uuid4()}';entry_id=str(uuid4())
+    attached=post(client,auth,f'/api/workouts/{wid}/exercises',{
+        'revision':2,'workout_entry_id':entry_id,
+        'exercise':{'id':exercise_id,'name':'Удержание','measurement_type':'reps_seconds','note':'Исходная заметка'},
+    })
+    assert attached.status_code==201
+    assert post(client,auth,f'/api/workouts/{wid}/sets',{
+        'id':str(uuid4()),'workout_exercise_id':entry_id,'set_number':1,'actual_reps':5,'actual_seconds':20,
+    }).status_code==201
+
+    live=next(x for x in client.get('/api/exercises?q=Удержание',headers=auth).json['exercises'] if x['id']==exercise_id)
+    edited=client.put(f'/api/exercises/{exercise_id}',json={
+        'revision':live['revision'],'name':'Переименовано','note':'Новая заметка','active':False,
+    },headers=auth)
+    assert edited.status_code==200
+
+    current=attached.json
+    for entry in current['exercises']:
+        if entry['is_ad_hoc']:continue
+        kind=entry['definition_snapshot']['measurement_type']
+        for number in range(1,entry['planned_sets']+1):
+            fact={'id':str(uuid4()),'workout_exercise_id':entry['id'],'set_number':number}
+            fact['actual_seconds' if kind=='seconds' else 'actual_reps']=entry['planned_seconds'] if kind=='seconds' else entry['planned_reps']
+            assert post(client,auth,f'/api/workouts/{wid}/sets',fact).status_code==201
+    finished=post(client,auth,f'/api/workouts/{wid}/finish',{
+        'revision':3,'status':'completed','post_checkin':{'overall_difficulty':5,'back_pain':3,'leg_symptoms_change':'same'},
+    })
+    assert finished.status_code==200
+    saved=client.get(f'/api/history/{wid}',headers=auth).json
+    custom=next(x for x in saved['exercises'] if x['id']==entry_id)
+    assert custom['definition_snapshot']['name']=='Удержание'
+    assert custom['definition_snapshot']['measurement_type']=='reps_seconds'
+    exported=client.get('/api/export.json',headers=auth).json['data']
+    assert next(x for x in exported['workout_exercises'] if x['id']==entry_id)['definition_snapshot']['name']=='Удержание'

@@ -11,10 +11,10 @@
     "yellow": {"pain_at_least": 7, "readiness_at_most": 2}
   },
   "exercise_library": {
-    "bird-dog": {"name": "Bird dog", "equipment": ["mat"], "measurement_type": "reps", "demo_only": true},
-    "band-row": {"name": "Тяга резинки сидя", "equipment": ["bands"], "measurement_type": "reps", "demo_only": true},
-    "bike-easy": {"name": "Велотренажёр", "equipment": ["stationary_bike"], "measurement_type": "seconds", "demo_only": true},
-    "walk-easy": {"name": "Спокойная ходьба", "equipment": [], "measurement_type": "seconds", "demo_only": true}
+    "bird-dog": {"id": "bird-dog", "name": "Bird dog", "equipment": ["mat"], "measurement_type": "reps", "review_status": "allowed", "active": true, "note": "", "demo_only": true},
+    "band-row": {"id": "band-row", "name": "Тяга резинки сидя", "equipment": ["bands"], "measurement_type": "reps", "review_status": "allowed", "active": true, "note": "", "demo_only": true},
+    "bike-easy": {"id": "bike-easy", "name": "Велотренажёр", "equipment": ["stationary_bike"], "measurement_type": "seconds", "review_status": "allowed", "active": true, "note": "", "demo_only": true},
+    "walk-easy": {"id": "walk-easy", "name": "Спокойная ходьба", "equipment": [], "measurement_type": "seconds", "review_status": "allowed", "active": true, "note": "", "demo_only": true}
   },
   "exercises": [
     {"exercise_id": "bird-dog", "planned_sets": 3, "planned_reps": 6, "planned_seconds": null, "planned_weight_kg": null, "yellow_factor": 0.67, "allowed_replacements": []},

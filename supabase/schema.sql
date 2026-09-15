@@ -19,7 +19,10 @@ create table if not exists exercise_library (
   instructions text not null default '',
   media_url text,
   equipment text[] not null default '{}',
-  measurement_type text not null check (measurement_type in ('reps','seconds','weighted_reps')),
+  measurement_type text not null check (measurement_type in ('reps','seconds','weighted_reps','reps_seconds')),
+  review_status text not null default 'needs_review' check (review_status in ('allowed','conditional','needs_review','blocked')),
+  note text not null default '',
+  source text not null default 'base_catalog' check (source in ('history_2023_2025','calisthenics_history','base_catalog','quick_user_entry')),
   demo_only boolean not null default true,
   approved boolean not null default false,
   active boolean not null default true,
@@ -109,15 +112,21 @@ create table if not exists workout_exercises (
   original_exercise_id text not null references exercise_library(id),
   exercise_id text not null references exercise_library(id),
   position integer not null check (position >= 1),
-  planned_sets integer not null check (planned_sets between 1 and 20),
+  planned_sets integer check (planned_sets between 1 and 20),
   planned_reps integer check (planned_reps between 1 and 1000),
   planned_seconds integer check (planned_seconds between 1 and 7200),
   planned_weight_kg numeric(6,2) check (planned_weight_kg >= 0),
   replacement_reason text,
+  definition_snapshot jsonb not null,
+  is_ad_hoc boolean not null default false,
   skipped boolean not null default false,
   skip_reason text,
   revision integer not null default 1 check (revision >= 1),
-  unique (workout_id, position)
+  unique (workout_id, position),
+  check (
+    (is_ad_hoc and planned_sets is null and planned_reps is null and planned_seconds is null and planned_weight_kg is null)
+    or (not is_ad_hoc and planned_sets between 1 and 20)
+  )
 );
 
 create table if not exists workout_sets (
@@ -219,6 +228,104 @@ create table if not exists scheduled_jobs (
 
 alter table workouts add column if not exists edited_at timestamptz;
 alter table workout_exercises add column if not exists removed boolean not null default false;
+alter table exercise_library add column if not exists review_status text;
+alter table exercise_library add column if not exists note text not null default '';
+alter table exercise_library add column if not exists source text;
+alter table workout_exercises add column if not exists definition_snapshot jsonb;
+alter table workout_exercises add column if not exists is_ad_hoc boolean not null default false;
+
+update exercise_library set review_status='needs_review' where review_status is null;
+update exercise_library set source='base_catalog' where source is null;
+
+alter table exercise_library alter column review_status set default 'needs_review';
+alter table exercise_library alter column review_status set not null;
+alter table exercise_library alter column source set default 'base_catalog';
+alter table exercise_library alter column source set not null;
+alter table exercise_library drop constraint if exists exercise_library_measurement_type_check;
+alter table exercise_library add constraint exercise_library_measurement_type_check
+  check (measurement_type in ('reps','seconds','weighted_reps','reps_seconds'));
+alter table exercise_library drop constraint if exists exercise_library_review_status_check;
+alter table exercise_library add constraint exercise_library_review_status_check
+  check (review_status in ('allowed','conditional','needs_review','blocked'));
+alter table exercise_library drop constraint if exists exercise_library_source_check;
+alter table exercise_library add constraint exercise_library_source_check
+  check (source in ('history_2023_2025','calisthenics_history','base_catalog','quick_user_entry'));
+
+update workout_exercises e set definition_snapshot=jsonb_build_object(
+  'id',e.exercise_id,
+  'name',coalesce(w.program_snapshot->'exercise_library'->e.exercise_id->>'name',e.exercise_id),
+  'measurement_type',coalesce(w.program_snapshot->'exercise_library'->e.exercise_id->>'measurement_type','reps'),
+  'note',coalesce(w.program_snapshot->'exercise_library'->e.exercise_id->>'note','')
+) from workouts w where w.id=e.workout_id and e.definition_snapshot is null;
+alter table workout_exercises alter column definition_snapshot set not null;
+alter table workout_exercises alter column planned_sets drop not null;
+alter table workout_exercises drop constraint if exists workout_exercises_planned_sets_check;
+alter table workout_exercises add constraint workout_exercises_planned_sets_check
+  check (planned_sets is null or planned_sets between 1 and 20);
+alter table workout_exercises drop constraint if exists workout_exercises_ad_hoc_plan_check;
+alter table workout_exercises add constraint workout_exercises_ad_hoc_plan_check check (
+  (is_ad_hoc and planned_sets is null and planned_reps is null and planned_seconds is null and planned_weight_kg is null)
+  or (not is_ad_hoc and planned_sets between 1 and 20)
+);
+
+create or replace function gym_sync_exercise_approval() returns trigger
+language plpgsql set search_path=public as $$
+begin
+  new.approved := new.active and new.review_status='allowed';
+  return new;
+end $$;
+drop trigger if exists exercise_approval_sync on exercise_library;
+create trigger exercise_approval_sync before insert or update on exercise_library
+for each row execute function gym_sync_exercise_approval();
+
+update exercise_library set approved=(active and review_status='allowed')
+where approved is distinct from (active and review_status='allowed');
+
+create or replace function gym_assert_program_eligible(p_program_id uuid) returns void
+language plpgsql set search_path=public as $$
+begin
+  if exists(
+    select 1 from program_session_exercises pse
+    join program_sessions ps on ps.id=pse.session_id
+    join exercise_library e on e.id=pse.exercise_id
+    where ps.program_version_id=p_program_id and (not e.active or e.review_status<>'allowed')
+  ) then raise exception 'program_has_unapproved_exercises'; end if;
+end $$;
+
+create or replace function gym_guard_program_activation() returns trigger
+language plpgsql set search_path=public as $$
+begin
+  if new.active then perform gym_assert_program_eligible(new.id); end if;
+  return new;
+end $$;
+drop trigger if exists program_activation_guard on program_versions;
+create trigger program_activation_guard before insert or update of active on program_versions
+for each row execute function gym_guard_program_activation();
+
+update program_versions p set active=false where p.active and exists(
+  select 1 from program_session_exercises pse
+  join program_sessions ps on ps.id=pse.session_id
+  join exercise_library e on e.id=pse.exercise_id
+  where ps.program_version_id=p.id and (not e.active or e.review_status<>'allowed')
+);
+
+create or replace function gym_deactivate_programs_for_exercise() returns trigger
+language plpgsql set search_path=public as $$
+begin
+  if not new.active or new.review_status<>'allowed' then
+    update program_versions p set active=false
+    where p.active and exists(
+      select 1 from program_session_exercises pse
+      join program_sessions ps on ps.id=pse.session_id
+      where ps.program_version_id=p.id and pse.exercise_id=new.id
+    );
+  end if;
+  return new;
+end $$;
+drop trigger if exists exercise_program_deactivation on exercise_library;
+create trigger exercise_program_deactivation after update of active, review_status on exercise_library
+for each row execute function gym_deactivate_programs_for_exercise();
+
 create table if not exists workout_edits (
  id uuid primary key default gen_random_uuid(), workout_id uuid references workouts(id),
  action text not null, data jsonb not null default '{}', created_at timestamptz not null default now()
@@ -319,12 +426,17 @@ begin
   for item in select * from jsonb_array_elements(p_exercises) loop
     insert into workout_exercises (
       id, workout_id, original_exercise_id, exercise_id, position,
-      planned_sets, planned_reps, planned_seconds, planned_weight_kg, replacement_reason
+      planned_sets, planned_reps, planned_seconds, planned_weight_kg, replacement_reason,
+      definition_snapshot, is_ad_hoc
     ) values (
       (item->>'id')::uuid, workout_id, item->>'original_exercise_id', item->>'exercise_id',
       (item->>'position')::integer, (item->>'planned_sets')::integer,
       nullif(item->>'planned_reps','')::integer, nullif(item->>'planned_seconds','')::integer,
-      nullif(item->>'planned_weight_kg','')::numeric, item->>'replacement_reason'
+      nullif(item->>'planned_weight_kg','')::numeric, item->>'replacement_reason',
+      coalesce(item->'definition_snapshot',p_workout->'program_snapshot'->'exercise_library'->(item->>'exercise_id'),
+        jsonb_build_object('id',item->>'exercise_id','name',item->>'exercise_id','measurement_type',
+          case when item->>'planned_seconds' is not null then 'seconds' else 'reps' end,'note','')),
+      coalesce((item->>'is_ad_hoc')::boolean,false)
     );
   end loop;
 
@@ -343,6 +455,7 @@ declare
   claim jsonb;
   token uuid;
   result jsonb;
+  measurement text;
 begin
   claim := gym_claim_operation(
     p_operation_id, 'save_set', (p_set->>'workout_id')::uuid, p_body_hash
@@ -352,9 +465,15 @@ begin
 
   perform 1 from workouts where id=(p_set->>'workout_id')::uuid and status='in_progress' for update;
   if not found then raise exception 'invalid_workout_state'; end if;
-  perform 1 from workout_exercises where id=(p_set->>'workout_exercise_id')::uuid
+  select definition_snapshot->>'measurement_type' into measurement from workout_exercises where id=(p_set->>'workout_exercise_id')::uuid
     and workout_id=(p_set->>'workout_id')::uuid and not removed and not skipped for update;
   if not found then raise exception 'exercise_unavailable'; end if;
+  if not (
+    (measurement='reps' and p_set->>'actual_reps' is not null and (p_set->>'actual_reps')::integer>0 and p_set->>'actual_seconds' is null and p_set->>'actual_weight_kg' is null)
+    or (measurement='seconds' and p_set->>'actual_reps' is null and p_set->>'actual_seconds' is not null and (p_set->>'actual_seconds')::integer>0 and p_set->>'actual_weight_kg' is null)
+    or (measurement='weighted_reps' and p_set->>'actual_reps' is not null and (p_set->>'actual_reps')::integer>0 and p_set->>'actual_seconds' is null and p_set->>'actual_weight_kg' is not null and (p_set->>'actual_weight_kg')::numeric>=0)
+    or (measurement='reps_seconds' and p_set->>'actual_reps' is not null and (p_set->>'actual_reps')::integer>0 and p_set->>'actual_seconds' is not null and (p_set->>'actual_seconds')::integer>0 and p_set->>'actual_weight_kg' is null)
+  ) then raise exception 'measurement_mismatch'; end if;
   insert into workout_sets (
     id, workout_id, workout_exercise_id, set_number, actual_reps,
     actual_seconds, actual_weight_kg, difficulty, effect, completed_at
@@ -391,7 +510,7 @@ begin
   token := (claim->>'token')::uuid;
 
   perform 1 from workouts where id=p_workout_id for update;
-  if p_status='completed' and exists(select 1 from workout_exercises e where e.workout_id=p_workout_id and not e.removed
+  if p_status='completed' and exists(select 1 from workout_exercises e where e.workout_id=p_workout_id and not e.removed and not e.is_ad_hoc
     and (e.skipped or (select count(*) from workout_sets s where s.workout_exercise_id=e.id)<e.planned_sets)) then raise exception 'incomplete_workout'; end if;
   update workouts set status = p_status, finished_at = p_finished_at,
     stop_reason = p_stop_reason, revision = revision + 1, updated_at = now()
@@ -474,7 +593,7 @@ create or replace function gym_replace_workout_exercise(
   p_operation_id uuid, p_body_hash text, p_workout_id uuid, p_revision integer,
   p_entry_id uuid, p_replacement_id text, p_reason text default ''
 ) returns jsonb language plpgsql security definer set search_path = public as $$
-declare claim jsonb; token uuid; entry workout_exercises; changed workouts; result jsonb;
+declare claim jsonb; token uuid; entry workout_exercises; changed workouts; result jsonb; replacement_definition jsonb;
 begin
   claim := gym_claim_operation(p_operation_id, 'replace', p_workout_id, p_body_hash);
   if claim->>'status' <> 'claimed' then return claim; end if;
@@ -486,21 +605,61 @@ begin
     select 1 from workouts w, jsonb_array_elements(w.program_snapshot->'exercises') source
     where w.id=p_workout_id and source->>'exercise_id'=entry.original_exercise_id
       and coalesce(source->'allowed_replacements','[]') ? p_replacement_id
-  ) or not exists(select 1 from exercise_library where id=p_replacement_id) then
+  ) then
     raise exception 'replacement_not_allowed';
   end if;
+  select w.program_snapshot->'exercise_library'->p_replacement_id into replacement_definition from workouts w where w.id=p_workout_id;
+  if replacement_definition is null or coalesce((replacement_definition->>'active')::boolean,true)=false
+     or replacement_definition->>'review_status'<>'allowed' then raise exception 'replacement_not_allowed'; end if;
   if not exists(select 1 from workouts where id=p_workout_id and status in ('preparing','in_progress') and revision=p_revision) then
     raise exception 'revision_conflict';
   end if;
   perform 1 from workouts where id=p_workout_id for update;
   if exists(select 1 from workout_sets where workout_exercise_id=p_entry_id) then raise exception 'exercise_has_sets'; end if;
-  if exists(select 1 from exercise_library r join exercise_library original on original.id=entry.exercise_id
-     where r.id=p_replacement_id and r.measurement_type <> original.measurement_type) then raise exception 'exercise_unavailable'; end if;
-  if exists(select 1 from checkins c join exercise_library r on r.id=p_replacement_id where c.workout_id=p_workout_id and c.kind='pre'
-     and not (coalesce(c.payload->'equipment','[]') @> to_jsonb(r.equipment))) then raise exception 'exercise_unavailable'; end if;
-  update workout_exercises set exercise_id=p_replacement_id,replacement_reason=p_reason,revision=revision+1 where id=p_entry_id;
+  if replacement_definition->>'measurement_type' <> entry.definition_snapshot->>'measurement_type' then raise exception 'exercise_unavailable'; end if;
+  if exists(select 1 from checkins c where c.workout_id=p_workout_id and c.kind='pre'
+     and not (coalesce(c.payload->'equipment','[]') @> coalesce(replacement_definition->'equipment','[]'))) then raise exception 'exercise_unavailable'; end if;
+  update workout_exercises set exercise_id=p_replacement_id,replacement_reason=p_reason,
+    definition_snapshot=jsonb_build_object('id',p_replacement_id,'name',replacement_definition->>'name',
+      'measurement_type',replacement_definition->>'measurement_type','note',coalesce(replacement_definition->>'note','')),
+    revision=revision+1 where id=p_entry_id;
   update workouts set revision=revision+1,updated_at=now() where id=p_workout_id returning * into changed;
   result := jsonb_build_object('workout_id',changed.id,'status',changed.status,'revision',changed.revision);
+  perform gym_commit_operation(p_operation_id,token,result);
+  return jsonb_build_object('status','succeeded','result',result);
+end $$;
+
+create or replace function gym_add_workout_exercise(
+  p_operation_id uuid, p_body_hash text, p_workout_id uuid, p_revision integer,
+  p_entry_id uuid, p_exercise jsonb
+) returns jsonb language plpgsql security definer set search_path=public as $$
+declare claim jsonb; token uuid; w workouts; card exercise_library; result jsonb; snapshot jsonb; next_position integer;
+begin
+  claim:=gym_claim_operation(p_operation_id,'add_workout_exercise',p_workout_id,p_body_hash);
+  if claim->>'status'<>'claimed' then return claim; end if;
+  token:=(claim->>'token')::uuid;
+  select * into w from workouts where id=p_workout_id for update;
+  if w.id is null then raise exception 'workout_not_found'; end if;
+  if w.status not in ('preparing','in_progress') then raise exception 'invalid_workout_state'; end if;
+  if w.revision<>p_revision then raise exception 'revision_conflict'; end if;
+  select * into card from exercise_library where id=p_exercise->>'id' for update;
+  if card.id is null then
+    if p_exercise->>'id' !~ '^custom-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+      then raise exception 'exercise_not_found'; end if;
+    insert into exercise_library(id,name,measurement_type,note,source,review_status,demo_only,active)
+    values(p_exercise->>'id',p_exercise->>'name',p_exercise->>'measurement_type',coalesce(p_exercise->>'note',''),
+      'quick_user_entry','needs_review',false,true) returning * into card;
+  elsif not card.active or card.review_status='blocked' then
+    raise exception 'exercise_unavailable';
+  end if;
+  if exists(select 1 from workout_exercises where id=p_entry_id) then raise exception 'workout_exercise_exists'; end if;
+  select coalesce(max(position),0)+1 into next_position from workout_exercises where workout_id=p_workout_id;
+  snapshot:=jsonb_build_object('id',card.id,'name',card.name,'measurement_type',card.measurement_type,'note',card.note);
+  insert into workout_exercises(id,workout_id,original_exercise_id,exercise_id,position,
+    planned_sets,planned_reps,planned_seconds,planned_weight_kg,definition_snapshot,is_ad_hoc)
+  values(p_entry_id,p_workout_id,card.id,card.id,next_position,null,null,null,null,snapshot,true);
+  update workouts set revision=revision+1,updated_at=now() where id=p_workout_id returning * into w;
+  result:=jsonb_build_object('workout_id',w.id,'revision',w.revision,'exercise_id',card.id,'entry_id',p_entry_id);
   perform gym_commit_operation(p_operation_id,token,result);
   return jsonb_build_object('status','succeeded','result',result);
 end $$;
@@ -543,15 +702,26 @@ create or replace function gym_update_set(
   p_operation_id uuid, p_body_hash text, p_workout_id uuid, p_revision integer,
   p_set_id uuid, p_set_revision integer, p_set_data jsonb
 ) returns jsonb language plpgsql security definer set search_path = public as $$
-declare claim jsonb; token uuid; changed workout_sets; result jsonb;
+declare claim jsonb; token uuid; changed workout_sets; current_set workout_sets; measurement text; reps integer; seconds integer; weight numeric; result jsonb;
 begin
   claim := gym_claim_operation(p_operation_id, 'update_set', p_workout_id, p_body_hash);
   if claim->>'status' <> 'claimed' then return claim; end if;
   token := (claim->>'token')::uuid;
+  select * into current_set from workout_sets where id=p_set_id and workout_id=p_workout_id for update;
+  if current_set.id is null then raise exception 'set_not_found'; end if;
+  if current_set.revision<>p_set_revision then raise exception 'revision_conflict'; end if;
+  select definition_snapshot->>'measurement_type' into measurement from workout_exercises where id=current_set.workout_exercise_id;
+  reps:=case when p_set_data ? 'actual_reps' then nullif(p_set_data->>'actual_reps','')::integer else current_set.actual_reps end;
+  seconds:=case when p_set_data ? 'actual_seconds' then nullif(p_set_data->>'actual_seconds','')::integer else current_set.actual_seconds end;
+  weight:=case when p_set_data ? 'actual_weight_kg' then nullif(p_set_data->>'actual_weight_kg','')::numeric else current_set.actual_weight_kg end;
+  if not (
+    (measurement='reps' and reps>0 and seconds is null and weight is null)
+    or (measurement='seconds' and reps is null and seconds>0 and weight is null)
+    or (measurement='weighted_reps' and reps>0 and seconds is null and weight>=0)
+    or (measurement='reps_seconds' and reps>0 and seconds>0 and weight is null)
+  ) then raise exception 'measurement_mismatch'; end if;
   update workout_sets set
-    actual_reps=coalesce((p_set_data->>'actual_reps')::integer,actual_reps),
-    actual_seconds=coalesce((p_set_data->>'actual_seconds')::integer,actual_seconds),
-    actual_weight_kg=coalesce((p_set_data->>'actual_weight_kg')::numeric,actual_weight_kg),
+    actual_reps=reps, actual_seconds=seconds, actual_weight_kg=weight,
     difficulty=coalesce((p_set_data->>'difficulty')::integer,difficulty),
     effect=coalesce(p_set_data->>'effect',effect), revision=revision+1
   where id=p_set_id and workout_id=p_workout_id and revision=p_set_revision returning * into changed;
@@ -671,6 +841,7 @@ revoke all on function gym_save_blocked_checkin(uuid,text,jsonb,jsonb,date) from
 revoke all on function gym_start_workout(uuid,text,uuid,integer) from public;
 revoke all on function gym_reorder_workout(uuid,text,uuid,integer,uuid[]) from public;
 revoke all on function gym_replace_workout_exercise(uuid,text,uuid,integer,uuid,text,text) from public;
+revoke all on function gym_add_workout_exercise(uuid,text,uuid,integer,uuid,jsonb) from public;
 revoke all on function gym_cancel_workout(uuid,text,uuid,integer,text) from public;
 revoke all on function gym_save_next_day_checkin(uuid,text,uuid,integer,jsonb) from public;
 revoke all on function gym_update_set(uuid,text,uuid,integer,uuid,integer,jsonb) from public;
@@ -693,9 +864,12 @@ begin
    if w.status<>'preparing' then raise exception 'invalid_workout_state'; end if;
    delete from workout_exercises where workout_id=w.id;
    for item in select * from jsonb_array_elements(p_data->'exercises') loop
-     insert into workout_exercises(id,workout_id,original_exercise_id,exercise_id,position,planned_sets,planned_reps,planned_seconds,planned_weight_kg,replacement_reason)
+     insert into workout_exercises(id,workout_id,original_exercise_id,exercise_id,position,planned_sets,planned_reps,planned_seconds,planned_weight_kg,replacement_reason,definition_snapshot,is_ad_hoc)
      values((item->>'id')::uuid,w.id,item->>'original_exercise_id',item->>'exercise_id',(item->>'position')::integer,(item->>'planned_sets')::integer,
-       (item->>'planned_reps')::integer,(item->>'planned_seconds')::integer,(item->>'planned_weight_kg')::numeric,item->>'replacement_reason');
+       (item->>'planned_reps')::integer,(item->>'planned_seconds')::integer,(item->>'planned_weight_kg')::numeric,item->>'replacement_reason',
+       coalesce(item->'definition_snapshot',p_data->'snapshot'->'exercise_library'->(item->>'exercise_id'),
+         jsonb_build_object('id',item->>'exercise_id','name',item->>'exercise_id','measurement_type',
+           case when item->>'planned_seconds' is not null then 'seconds' else 'reps' end,'note','')),false);
    end loop;
    update workouts set checkin_mode=p_data->'evaluation'->>'mode', checkin_reasons=array(select jsonb_array_elements_text(p_data->'evaluation'->'reasons')),
      program_snapshot=p_data->'snapshot', status=case when (p_data->'evaluation'->>'blocks_workout')::boolean then 'cancelled' else 'preparing' end,

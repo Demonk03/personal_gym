@@ -1,5 +1,7 @@
 from uuid import uuid4
 
+import pytest
+
 from app import create_app
 from db import MemoryRepository
 from gpt import ReviewValidationError
@@ -161,7 +163,8 @@ def test_full_workout_lifecycle_and_stale_revision(client, auth, repository):
     set_operation = str(uuid4())
     set_body = {
         "idempotency_key": set_operation, "id": str(uuid4()),
-        "workout_exercise_id": first_exercise["id"], "set_number": 1, "actual_reps": 6,
+        "workout_exercise_id": first_exercise["id"], "set_number": 1,
+        **({"actual_seconds": 60} if first_exercise["definition_snapshot"]["measurement_type"] == "seconds" else {"actual_reps": 6}),
     }
     saved = client.post(f"/api/workouts/{workout_id}/sets", json=set_body, headers=auth)
     repeated = client.post(f"/api/workouts/{workout_id}/sets", json=set_body, headers=auth)
@@ -256,6 +259,82 @@ def test_progress_rejects_invalid_period(client, auth):
     missing = client.get("/api/progress", headers=auth)
     backwards = client.get("/api/progress?from=2026-09-30&to=2026-09-01", headers=auth)
     assert missing.status_code == backwards.status_code == 400
+
+
+def test_exercise_catalog_manual_review_and_archive(client, auth, repository):
+    listed = client.get("/api/exercises?q=bird", headers=auth)
+    assert listed.status_code == 200
+    card = listed.get_json()["exercises"][0]
+    assert card["id"] == "bird-dog"
+
+    saved = client.put("/api/exercises/bird-dog", json={
+        "revision": card["revision"], "review_status": "needs_review", "note": "Проверить технику",
+    }, headers=auth)
+    assert saved.status_code == 200
+    assert saved.get_json()["approved"] is False
+    stale = client.put("/api/exercises/bird-dog", json={
+        "revision": card["revision"], "review_status": "allowed",
+    }, headers=auth)
+    assert stale.status_code == 409
+
+    archived = client.put("/api/exercises/bird-dog", json={
+        "revision": saved.get_json()["revision"], "active": False,
+    }, headers=auth)
+    assert archived.status_code == 200
+    assert client.get("/api/exercises?q=bird", headers=auth).get_json()["exercises"] == []
+
+
+def test_quick_exercise_is_atomic_idempotent_and_snapshot_safe(client, auth, repository):
+    prepared, _ = prepare(client, auth)
+    workout_id = prepared.get_json()["workout"]["id"]
+    started = client.post(f"/api/workouts/{workout_id}/start", json=operation(revision=1), headers=auth).get_json()
+    malformed = client.post(f"/api/workouts/{workout_id}/exercises", json=operation(
+        revision=started["workout"]["revision"], workout_entry_id=str(uuid4()),
+        exercise={"id": "custom-not-a-uuid", "name": "Ошибка", "measurement_type": "reps"},
+    ), headers=auth)
+    assert malformed.status_code == 400
+    op_id, exercise_id, entry_id = str(uuid4()), f"custom-{uuid4()}", str(uuid4())
+    body = {
+        "idempotency_key": op_id, "revision": started["workout"]["revision"], "workout_entry_id": entry_id,
+        "exercise": {"id": exercise_id, "name": "Статический тест", "measurement_type": "reps_seconds", "note": "Стойка"},
+    }
+    first = client.post(f"/api/workouts/{workout_id}/exercises", json=body, headers=auth)
+    repeated = client.post(f"/api/workouts/{workout_id}/exercises", json=body, headers=auth)
+    assert first.status_code == repeated.status_code == 201
+    assert first.get_json() == repeated.get_json()
+    entry = next(row for row in first.get_json()["exercises"] if row["id"] == entry_id)
+    assert entry["is_ad_hoc"] is True
+    assert entry["planned_sets"] is None
+    assert entry["definition_snapshot"] == {"id": exercise_id, "name": "Статический тест", "measurement_type": "reps_seconds", "note": "Стойка"}
+    assert repository.catalog[exercise_id]["review_status"] == "needs_review"
+    assert client.post(f"/api/workouts/{workout_id}/exercises", json={**body, "exercise": {**body["exercise"], "name": "Другое"}}, headers=auth).status_code == 409
+
+
+@pytest.mark.parametrize(("measurement_type", "valid", "invalid"), [
+    ("reps", {"actual_reps": 8}, {"actual_seconds": 30}),
+    ("seconds", {"actual_seconds": 30}, {"actual_reps": 8}),
+    ("weighted_reps", {"actual_reps": 8, "actual_weight_kg": 0}, {"actual_reps": 8}),
+    ("reps_seconds", {"actual_reps": 8, "actual_seconds": 30}, {"actual_reps": 8, "actual_seconds": 30, "actual_weight_kg": 1}),
+])
+def test_quick_exercise_measurement_matrix(client, auth, measurement_type, valid, invalid):
+    prepared, _ = prepare(client, auth)
+    workout_id = prepared.get_json()["workout"]["id"]
+    started = client.post(f"/api/workouts/{workout_id}/start", json=operation(revision=1), headers=auth).get_json()
+    entry_id, exercise_id = str(uuid4()), f"custom-{uuid4()}"
+    attached = client.post(f"/api/workouts/{workout_id}/exercises", json=operation(
+        revision=started["workout"]["revision"], workout_entry_id=entry_id,
+        exercise={"id": exercise_id, "name": measurement_type, "measurement_type": measurement_type, "note": ""},
+    ), headers=auth)
+    assert attached.status_code == 201
+    bad = client.post(f"/api/workouts/{workout_id}/sets", json=operation(
+        id=str(uuid4()), workout_exercise_id=entry_id, set_number=1, **invalid,
+    ), headers=auth)
+    good = client.post(f"/api/workouts/{workout_id}/sets", json=operation(
+        id=str(uuid4()), workout_exercise_id=entry_id, set_number=1, **valid,
+    ), headers=auth)
+    assert bad.status_code == 422
+    assert bad.get_json()["error"]["code"] == "measurement_mismatch"
+    assert good.status_code == 201
 
 
 class FakeReviewService:

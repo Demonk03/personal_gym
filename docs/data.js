@@ -19,6 +19,17 @@ export function project(bundle,queue){
  if(!bundle)return null;const b=structuredClone(bundle);
  for(const op of queue.filter(o=>o.workoutId===b.workout.id)){
  const p=op.body;
+ if(op.path.endsWith('/exercises')&&op.method==='POST'){
+  const d=p.definition_snapshot||p.exercise;
+  b.workout.program_snapshot.exercise_library ||= {};
+  if(!b.workout.program_snapshot.exercise_library[p.exercise.id])b.workout.program_snapshot.exercise_library[p.exercise.id]={...d};
+  if(!b.exercises.some(e=>e.id===p.workout_entry_id))b.exercises.push({
+   id:p.workout_entry_id,workout_id:b.workout.id,original_exercise_id:p.exercise.id,exercise_id:p.exercise.id,
+   position:Math.max(0,...b.exercises.map(e=>e.position||0))+1,planned_sets:null,planned_reps:null,
+   planned_seconds:null,planned_weight_kg:null,definition_snapshot:{...d},is_ad_hoc:true,
+   removed:false,skipped:false,revision:1
+  });
+ }
  if(op.path.endsWith('/sets')&&op.method==='POST'&&!b.sets.some(s=>s.id===p.id))b.sets.push({...p,revision:1,completed_at:op.created});
  if(p.action==='undo_set')b.sets=b.sets.filter(s=>s.id!==p.set_id);
  if(['remove','restore','skip','unskip'].includes(p.action)){const e=b.exercises.find(e=>e.id===p.entry_id);if(e)e[['remove','restore'].includes(p.action)?'removed':'skipped']=['remove','skip'].includes(p.action)}
@@ -29,11 +40,12 @@ export function project(bundle,queue){
 export class Queue{
  constructor(store,config,onChange){Object.assign(this,{store,config,onChange});this.running=false}
  async read(){return await this.store.get('queue')||[]}
- async add(op){await this.store.update('queue',items=>[...(items||[]),{...op,id:uuid(),created:new Date().toISOString(),state:'local',body:{...op.body,idempotency_key:uuid()}}]);await this.onChange();void this.flush()}
+ async add(op){const item={...op,id:uuid(),created:new Date().toISOString(),state:'local',body:{...op.body,idempotency_key:op.body?.idempotency_key||uuid()}};await this.store.update('queue',items=>[...(items||[]),item]);await this.onChange();void this.flush();return item}
 
  async flush(){
  if(this.running||!navigator.onLine||(this.canFlush&&!this.canFlush()))return;this.running=true;
  const run=async()=>{let items=await this.read();while(items.length){let op=items[0];if(op.state==='conflict')break;
+ if(op.dependsOn&&items.some(parent=>parent.body?.idempotency_key===op.dependsOn))break;
  try{
   let result;
   if(op.sent){try{const status=await request(this.config,`/api/operations/${op.body.idempotency_key}`);if(status.status==='succeeded')result=status.result;if(status.status==='pending')break}catch(e){if(e.status!==404)throw e}}

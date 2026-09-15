@@ -31,17 +31,56 @@ test("schema is repeatable and contains the backend tables", async () => {
   await db.close();
 });
 
-test("demo seed is repeatable and stays unapproved", async () => {
+test("87-entry manifest is repeatable and keeps conservative statuses", async () => {
   const db = await database();
   await db.exec(seed);
   await db.exec(seed);
-  const exercises = await db.query(
-    "select count(*)::int as count, bool_and(demo_only and not approved) as safe from exercise_library",
-  );
-  assert.equal(exercises.rows[0].count, 7);
-  assert.equal(exercises.rows[0].safe, true);
-  const programs = await db.query("select count(*)::int as count from program_versions where active");
-  assert.equal(programs.rows[0].count, 1);
+  const exercises = await db.query(`select count(*)::int as count,
+    count(*) filter(where review_status='allowed')::int as allowed,
+    count(*) filter(where review_status='blocked')::int as blocked,
+    count(distinct id)::int as unique_ids from exercise_library where active`);
+  assert.deepEqual(exercises.rows[0], {count:87,allowed:1,blocked:4,unique_ids:87});
+  assert.equal((await db.query("select approved from exercise_library where id='walk-easy'")).rows[0].approved,true);
+  assert.equal((await db.query("select active from program_versions where id='10000000-0000-4000-8000-000000000001'")).rows[0].active,false);
+  await db.close();
+});
+
+test("catalog status, workout snapshot, atomic quick exercise and measurement matrix", async () => {
+  const db=await database();await db.exec(seed);const {randomUUID}=require('node:crypto');
+  const columns=await db.query(`select table_name,column_name,is_nullable from information_schema.columns
+    where table_name in ('exercise_library','workout_exercises')`);
+  assert.ok(columns.rows.some(r=>r.table_name==='exercise_library'&&r.column_name==='review_status'));
+  assert.ok(columns.rows.some(r=>r.table_name==='workout_exercises'&&r.column_name==='definition_snapshot'&&r.is_nullable==='NO'));
+  assert.ok(columns.rows.some(r=>r.table_name==='workout_exercises'&&r.column_name==='is_ad_hoc'));
+  await assert.rejects(db.query("update program_versions set active=true where id='10000000-0000-4000-8000-000000000001'"),/program_has_unapproved_exercises/);
+  const programId=randomUUID(),sessionId=randomUUID();
+  await db.query(`insert into program_versions(id,version,name,rule_version,active) values($1,99,'Рабочая','v1',false)`,[programId]);
+  await db.query(`insert into program_sessions(id,program_version_id,session_key,name,session_type,weekday,estimated_minutes,position)
+    values($1,$2,'safe','Безопасная','full_body',1,20,1)`,[sessionId,programId]);
+  await db.query(`insert into program_session_exercises(id,session_id,exercise_id,position,planned_sets,planned_seconds)
+    values($1,$2,'walk-easy',1,1,300)`,[randomUUID(),sessionId]);
+  await db.query('update program_versions set active=true where id=$1',[programId]);
+  await db.query("update exercise_library set review_status='blocked' where id='walk-easy'");
+  assert.equal((await db.query('select active from program_versions where id=$1',[programId])).rows[0].active,false);
+
+  const wid=randomUUID(),eid=randomUUID(),exerciseId=`custom-${randomUUID()}`;
+  await db.query(`insert into workouts(id,status,checkin_mode,rule_version,program_snapshot)
+    values($1,'in_progress','green','v1','{}')`,[wid]);
+  const body={id:exerciseId,name:'Изометрия',measurement_type:'reps_seconds',note:'Тест'};
+  const op=randomUUID(),args=[op,'attach',wid,1,eid,JSON.stringify(body)];
+  const first=await db.query('select gym_add_workout_exercise($1,$2,$3,$4,$5,$6) value',args);
+  const repeated=await db.query('select gym_add_workout_exercise($1,$2,$3,$4,$5,$6) value',args);
+  assert.equal(first.rows[0].value.result.entry_id,eid);
+  assert.deepEqual(repeated.rows[0].value,first.rows[0].value);
+  const entry=(await db.query('select * from workout_exercises where id=$1',[eid])).rows[0];
+  assert.equal(entry.is_ad_hoc,true);assert.equal(entry.planned_sets,null);assert.equal(entry.definition_snapshot.name,'Изометрия');
+  const invalid={id:randomUUID(),workout_id:wid,workout_exercise_id:eid,set_number:1,actual_reps:5};
+  await assert.rejects(db.query('select gym_save_set($1,$2,$3)',[randomUUID(),'bad',JSON.stringify(invalid)]),/measurement_mismatch/);
+  const valid={...invalid,id:randomUUID(),actual_seconds:20};
+  await db.query('select gym_save_set($1,$2,$3)',[randomUUID(),'good',JSON.stringify(valid)]);
+  await db.query(`update workouts set revision=2 where id=$1`,[wid]);
+  await db.query(`select gym_finish_workout($1,'finish',$2,2,'completed',now(),null,'{}')`,[randomUUID(),wid]);
+  assert.equal((await db.query('select status from workouts where id=$1',[wid])).rows[0].status,'completed');
   await db.close();
 });
 
@@ -104,6 +143,10 @@ test("workout, set, and finish RPCs are idempotent and revision-safe", async () 
     rule_version: "demo-rules-v1",
     profile_snapshot: {},
     program_snapshot: {
+      exercise_library: {
+        "incline-pushup": {id:"incline-pushup",name:"Наклонные",measurement_type:"reps",review_status:"allowed",active:true,equipment:[],note:""},
+        "wall-pushup": {id:"wall-pushup",name:"От стены",measurement_type:"reps",review_status:"allowed",active:true,equipment:[],note:""},
+      },
       exercises: [{exercise_id: "incline-pushup", allowed_replacements: ["wall-pushup"]}],
     },
   });

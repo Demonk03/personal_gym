@@ -2,6 +2,7 @@ import hmac
 import csv
 import io
 import os
+import re
 from datetime import date, datetime, timedelta, timezone
 from functools import wraps
 from typing import Any
@@ -16,6 +17,11 @@ import gpt
 import operations
 from metrics import build_progress
 from training import build_workout, evaluate_checkin
+
+
+EXERCISE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,63}$")
+MEASUREMENT_TYPES = {"reps", "seconds", "weighted_reps", "reps_seconds"}
+REVIEW_STATUSES = {"allowed", "conditional", "needs_review", "blocked"}
 
 
 class APIError(Exception):
@@ -42,6 +48,12 @@ def _uuid(value: Any, field: str) -> str:
 
 def _operation(payload: dict[str, Any]) -> str:
     return _uuid(payload.get("idempotency_key"), "idempotency_key")
+
+
+def _exercise_id(value: Any, field="exercise_id") -> str:
+    if not isinstance(value, str) or not EXERCISE_ID_RE.fullmatch(value):
+        raise APIError(f"Поле {field} должно быть корректным ID упражнения")
+    return value
 
 
 def _integer(payload: dict[str, Any], field: str, minimum: int, maximum: int) -> int:
@@ -211,6 +223,46 @@ def create_app(repository=None, weekly_review_service=None) -> Flask:
     def bootstrap():
         return jsonify(repo().bootstrap())
 
+    @app.get("/api/exercises")
+    @require_api_key
+    def exercise_catalog():
+        query = request.args.get("q", "").strip()
+        if len(query) > 160:
+            raise APIError("Параметр q слишком длинный")
+        return jsonify({"exercises": repo().list_exercises(query)})
+
+    @app.put("/api/exercises/<exercise_id>")
+    @require_api_key
+    def update_exercise(exercise_id):
+        payload = _json()
+        allowed = {"name", "measurement_type", "review_status", "note", "active", "revision"}
+        if set(payload) - allowed:
+            raise APIError("Переданы неизвестные поля")
+        changes = {}
+        if "name" in payload:
+            changes["name"] = _text(payload, "name", required=True, max_length=160)
+        if "note" in payload:
+            changes["note"] = _text(payload, "note", max_length=2000)
+        if "measurement_type" in payload:
+            value = _text(payload, "measurement_type", required=True, max_length=30)
+            if value not in MEASUREMENT_TYPES:
+                raise APIError("Некорректный формат измерения")
+            changes["measurement_type"] = value
+        if "review_status" in payload:
+            value = _text(payload, "review_status", required=True, max_length=30)
+            if value not in REVIEW_STATUSES:
+                raise APIError("Некорректный статус упражнения")
+            changes["review_status"] = value
+        if "active" in payload:
+            if not isinstance(payload["active"], bool):
+                raise APIError("Поле active должно быть true или false")
+            changes["active"] = payload["active"]
+        if not changes:
+            raise APIError("Нет изменений упражнения")
+        return jsonify(repo().update_exercise(
+            _exercise_id(exercise_id), _integer(payload, "revision", 1, 1_000_000), changes,
+        ))
+
     @app.get("/api/workouts/active")
     @require_api_key
     def active_workout():
@@ -298,6 +350,32 @@ def create_app(repository=None, weekly_review_service=None) -> Flask:
             p_reason=_text(payload, "reason", max_length=300))
         return jsonify(result)
 
+    @app.post("/api/workouts/<workout_id>/exercises")
+    @require_api_key
+    def add_workout_exercise(workout_id):
+        payload, operation_id, digest = mutation_payload()
+        raw = payload.get("exercise")
+        if not isinstance(raw, dict):
+            raise APIError("Поле exercise должно быть объектом")
+        exercise_id = _exercise_id(raw.get("id"))
+        exercise = {"id": exercise_id}
+        if exercise_id.startswith("custom-"):
+            _uuid(exercise_id.removeprefix("custom-"), "exercise.id")
+            exercise["name"] = _text(raw, "name", required=True, max_length=160)
+            measurement = _text(raw, "measurement_type", required=True, max_length=30)
+            if measurement not in MEASUREMENT_TYPES:
+                raise APIError("Некорректный формат измерения")
+            exercise["measurement_type"] = measurement
+            exercise["note"] = _text(raw, "note", max_length=2000)
+        elif set(raw) != {"id"}:
+            raise APIError("Для существующего упражнения передай только id")
+        result = repo().add_workout_exercise(
+            operation_id, digest, _uuid(workout_id, "workout_id"),
+            _integer(payload, "revision", 1, 1_000_000),
+            _uuid(payload.get("workout_entry_id"), "workout_entry_id"), exercise,
+        )
+        return jsonify(result), 201
+
     @app.post("/api/workouts/<workout_id>/sets")
     @require_api_key
     def save_set(workout_id):
@@ -307,14 +385,20 @@ def create_app(repository=None, weekly_review_service=None) -> Flask:
             "workout_exercise_id": _uuid(payload.get("workout_exercise_id"), "workout_exercise_id"),
             "set_number": _integer(payload, "set_number", 1, 50),
             "completed_at": _timestamp(payload,"completed_at") if payload.get("completed_at") else datetime.now(timezone.utc).isoformat(),
-            "actual_reps": _optional_integer(payload, "actual_reps", 0, 1000),
-            "actual_seconds": _optional_integer(payload, "actual_seconds", 0, 7200),
+            "actual_reps": _optional_integer(payload, "actual_reps", 1, 1000),
+            "actual_seconds": _optional_integer(payload, "actual_seconds", 1, 7200),
             "actual_weight_kg": _number(payload, "actual_weight_kg", 0, 400),
             "difficulty": _optional_integer(payload, "difficulty", 1, 10),
             "effect": _text(payload, "effect", max_length=20) or None,
         }
-        if set_data["actual_reps"] is None and set_data["actual_seconds"] is None:
-            raise APIError("Укажи повторы или секунды")
+        bundle = repo().get_workout(set_data["workout_id"])
+        entry = next((row for row in bundle["exercises"] if row["id"] == set_data["workout_exercise_id"]), None)
+        if not entry:
+            raise db.NotFound("workout_exercise_not_found")
+        try:
+            db.validate_set_fact((entry.get("definition_snapshot") or {}).get("measurement_type"), set_data)
+        except db.Conflict:
+            raise APIError("Факт не соответствует формату упражнения", 422, "measurement_mismatch") from None
         if set_data["effect"] not in {None, "better", "same", "worse"}:
             raise APIError("Некорректное значение effect")
         return jsonify(repo().save_set(operation_id, digest, set_data)), 201
@@ -323,10 +407,12 @@ def create_app(repository=None, weekly_review_service=None) -> Flask:
     @require_api_key
     def update_set(workout_id):
         payload, operation_id, digest = mutation_payload()
+        clean_workout_id = _uuid(workout_id, "workout_id")
+        clean_set_id = _uuid(payload.get("id"), "id")
         set_data = {
             key: value for key, value in {
-                "actual_reps": _optional_integer(payload, "actual_reps", 0, 1000),
-                "actual_seconds": _optional_integer(payload, "actual_seconds", 0, 7200),
+                "actual_reps": _optional_integer(payload, "actual_reps", 1, 1000),
+                "actual_seconds": _optional_integer(payload, "actual_seconds", 1, 7200),
                 "actual_weight_kg": _number(payload, "actual_weight_kg", 0, 400),
                 "difficulty": _optional_integer(payload, "difficulty", 1, 10),
                 "effect": _text(payload, "effect", max_length=20) or None,
@@ -334,9 +420,21 @@ def create_app(repository=None, weekly_review_service=None) -> Flask:
         }
         if not set_data:
             raise APIError("Нет изменений подхода")
+        bundle = repo().get_workout(clean_workout_id)
+        current_set = next((row for row in bundle["sets"] if row["id"] == clean_set_id), None)
+        if not current_set:
+            raise db.NotFound("set_not_found")
+        entry = next((row for row in bundle["exercises"] if row["id"] == current_set["workout_exercise_id"]), None)
+        try:
+            db.validate_set_fact(
+                (entry.get("definition_snapshot") or {}).get("measurement_type") if entry else "",
+                {**current_set, **set_data},
+            )
+        except db.Conflict:
+            raise APIError("Факт не соответствует формату упражнения", 422, "measurement_mismatch") from None
         result = repo().mutate_workout("update_set", operation_id, digest,
-            p_workout_id=_uuid(workout_id, "workout_id"), p_revision=None,
-            p_set_id=_uuid(payload.get("id"), "id"), p_set_revision=_integer(payload, "revision", 1, 1_000_000), p_set_data=set_data)
+            p_workout_id=clean_workout_id, p_revision=None,
+            p_set_id=clean_set_id, p_set_revision=_integer(payload, "revision", 1, 1_000_000), p_set_data=set_data)
         return jsonify(result)
 
     @app.post("/api/workouts/<workout_id>/finish")

@@ -8,6 +8,7 @@ The authoritative rules are `training.py` / `demo-rules-v1`. The HTML design run
 - `GET /api/today`: local date in profile timezone, active workout bundle, latest blocked check-in for that date, scheduled sessions, and unanswered next-day check-ins from the last 14 days. No answer is fabricated for missing symptoms.
 - `GET /api/workouts/:id`: `{workout, exercises, sets, checkins}`. Prepared and mutation responses also return bundles where appropriate. Operation recovery can return a small stored result; the client rereads the bundle before removing the operation from its queue.
 - `GET /api/measurements`: chronological `entries[]`, in cm.
+- `GET /api/exercises?q=`: active exercise cards with manual review status, source, format and revision. Results are cached per connection for offline search.
 - Weekly review GET includes the saved review, deterministic facts, no-data flag and the number of missing next-day answers. The UI shows the preceding complete calendar week, without asserting full data coverage from workout count alone.
 
 ## Writes
@@ -25,8 +26,14 @@ All workout edits, weight writes and measurements require a UUID `idempotency_ke
 | action `edit_post` | post_checkin; only completed/stopped_early; marks the workout edited |
 | `POST /api/measurements` | measured_at with timezone; waist_cm, chest_cm, hips_cm, thigh_cm, each 10–300 |
 | `POST /api/push/subscription` | native PushSubscription JSON and boolean preferences next_day/review |
+| `PUT /api/exercises/:id` | revision and any manual changes to name, note, measurement_type, review_status or active |
+| `POST /api/workouts/:id/exercises` | revision, stable workout_entry_id, and either an existing exercise ID or a `custom-<uuid>` card with name, format and optional note |
 
 Replacement cannot change an exercise with recorded sets. Equipment and measurement type must match. Auto-replacement and omission reasons survive database round-trips. Completed status requires all non-removed exercises to have their prescribed number of sets and no skips; otherwise use stopped_early and a reason. Set recording accepts an optional timezone-bearing completed_at so offline facts retain their timestamp.
+
+Program construction and replacements accept only active `allowed` cards. Explicit manual attachment accepts active `allowed`, `conditional`, or `needs_review` cards; `blocked` cards are rejected until their status is changed separately. Custom cards always start as active `needs_review` records with `quick_user_entry` source. Ad-hoc entries have no planned dose and never block completion of planned work.
+
+Every workout entry stores `definition_snapshot` (`id`, name, format and note). History and exports use it instead of the live catalog. Facts are validated from this snapshot: `reps` requires only repetitions, `seconds` only time, `weighted_reps` repetitions plus a nonnegative weight, and `reps_seconds` both repetitions and time.
 
 ## UI decisions
 
@@ -42,6 +49,8 @@ Replacement cannot change an exercise with recorded sets. Equipment and measurem
 
 New preparation/start require network. Active workouts, weight and measurements use an IndexedDB queue. The queue atomically appends records, retains immutable operation payloads, drains sequentially and updates confirmed revisions only after successful server reads. Timed-out requests query operation status before retrying. A revision conflict stops the queue and offers explicit comparison/retry against the current server version. Local data is isolated by a hash of API URL and key; changing connection is blocked while a queue is pending.
 
+Quick exercise creation may begin offline during an active workout. Its create-and-attach operation is queued before dependent set writes; dependent items are not sent until the parent operation is confirmed. Entity and operation IDs are generated once and reused after reload or unknown outcomes.
+
 A renewable IndexedDB lease coordinates the writing tab; explicit takeover is available. Web Locks additionally serialize queue draining where supported. Tab coordination is local to a browser; cross-device edits are protected by server revisions and unique set numbers rather than a global device lock.
 
 The service worker caches only the application shell and Onest font responses; it excludes authenticated requests and API URLs. Opened history details and read models are cached separately in the connection's IndexedDB database. Previously unopened history details require network.
@@ -49,5 +58,7 @@ The service worker caches only the application shell and Onest font responses; i
 ## Delivery boundary
 
 Schema changes are repeatable in `supabase/schema.sql` and were checked using PGlite. Apply the updated schema to the target Supabase project before running this frontend against it. The local demo uses MemoryRepository and synthetic data. No migration, deployment or notification delivery to a real device was performed as part of local implementation.
+
+Migration order for this release: apply `schema.sql` twice, apply the catalog seed, confirm 87 active cards (1 allowed, 4 blocked), confirm the old demo program is inactive, manually review desired program cards, and only then activate a replacement program. Existing workout history remains readable from snapshots.
 
 Push requires pywebpush, VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY, VAPID_SUBJECT and a scheduler invoking `python3 jobs.py` every minute. Next-day reminders become due at 09:00 local the following morning; the preceding week's review is generated Monday at/after 09:00. Failed notifications retry; expired subscriptions are disabled. Notification text contains no health information. Delivery is at-least-once after an ambiguous network failure; stable notification tags coalesce repeats on the device.
