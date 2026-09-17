@@ -10,6 +10,13 @@ test('exercise library interface exposes quick entry, statuses, and all measurem
  assert.match(source,/data-action="catalog-edit"/);assert.match(source,/'create-exercise'/);
 });
 
+test('program badge labels pilot rules honestly on both program surfaces',()=>{
+ const source=fs.readFileSync(path.join(__dirname,'../docs/app.js'),'utf8');
+ assert.match(source,/const programBadge=/);
+ assert.match(source,/pilot-rules-v1.*ПИЛОТ/);
+ assert.equal((source.match(/programBadge\(boot\.program\)/g)||[]).length,2);
+});
+
 test('queue keeps a new set added while previous request is in flight',async()=>{
  const {Queue}=await import('../docs/data.js');const store=new MemoryStore();let release;const gate=new Promise(r=>release=r);const calls=[];
  global.fetch=async(url,options)=>{calls.push(JSON.parse(options.body));if(calls.length===1)await gate;return response({saved:true})};

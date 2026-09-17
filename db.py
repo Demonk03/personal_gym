@@ -352,7 +352,13 @@ class SupabaseRepository:
 
 
 def demo_rules(version: str = "demo-rules-v1") -> dict[str, Any]:
-    return {"version": version, "demo_only": True, "yellow": {"pain_at_least": 7, "readiness_at_most": 2}}
+    pilot = version == "pilot-rules-v1"
+    return {
+        "version": version,
+        "demo_only": not pilot,
+        "pilot": pilot,
+        "yellow": {"pain_at_least": 7, "readiness_at_most": 2},
+    }
 
 
 class MemoryRepository:

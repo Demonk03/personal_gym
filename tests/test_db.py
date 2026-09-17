@@ -9,6 +9,17 @@ from db import MemoryRepository, NotFound
 from operations import OperationConflict, execute_operation
 
 
+def test_rule_metadata_distinguishes_demo_and_pilot():
+    demo = db.demo_rules("demo-rules-v1")
+    pilot = db.demo_rules("pilot-rules-v1")
+
+    assert demo["demo_only"] is True
+    assert demo["pilot"] is False
+    assert pilot["demo_only"] is False
+    assert pilot["pilot"] is True
+    assert pilot["yellow"] == demo["yellow"]
+
+
 def test_memory_operation_returns_saved_result_and_rejects_changed_body():
     repository = MemoryRepository()
     operation_id = "60000000-0000-4000-8000-000000000001"

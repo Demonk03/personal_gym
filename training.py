@@ -65,18 +65,19 @@ def _valid_checkin(checkin: dict[str, Any]) -> tuple[bool, list[str]]:
 
 
 def evaluate_checkin(checkin: dict[str, Any], rules: dict[str, Any]) -> dict[str, Any]:
-    """Return a versioned demo mode without making a medical inference."""
+    """Return a versioned deterministic mode without making a medical inference."""
     if not isinstance(checkin, dict) or not isinstance(rules, dict):
         return {
             "mode": "yellow", "reasons": ["invalid:payload"], "blocks_workout": False,
             "complete": False, "rule_version": rules.get("version") if isinstance(rules, dict) else None,
-            "demo_only": True,
+            "demo_only": True, "pilot": False,
         }
     valid, validation_reasons = _valid_checkin(checkin)
     result = {
         "mode": "yellow", "reasons": validation_reasons, "blocks_workout": False,
         "complete": valid, "rule_version": rules.get("version"),
         "demo_only": bool(rules.get("demo_only", True)),
+        "pilot": bool(rules.get("pilot", False)),
     }
     if not valid:
         return result

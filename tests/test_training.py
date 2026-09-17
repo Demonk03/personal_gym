@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 
 from training import build_workout, evaluate_checkin
+from db import demo_rules
 
 
 FIXTURE = Path(__file__).parent / "fixtures" / "demo_program.json"
@@ -65,6 +66,14 @@ def test_incomplete_or_unknown_value_never_returns_green(program):
     assert first["complete"] is second["complete"] is False
     assert "missing:readiness" in first["reasons"]
     assert "invalid:pain_change" in second["reasons"]
+
+
+def test_pilot_rule_metadata_is_preserved_in_checkin_result():
+    result = evaluate_checkin(base_checkin(), demo_rules("pilot-rules-v1"))
+
+    assert result["rule_version"] == "pilot-rules-v1"
+    assert result["demo_only"] is False
+    assert result["pilot"] is True
 
 
 def test_build_green_workout_keeps_dose_and_uses_allowed_equipment_replacement(program):
