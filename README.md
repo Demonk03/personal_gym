@@ -13,12 +13,28 @@ Open http://127.0.0.1:8774. In Settings, use that server address and the **test-
 ## API and static PWA
 
 1. Install `requirements.txt` in a Python environment and configure `.env` from `.env.example`.
-2. Apply `supabase/schema.sql` twice (the second pass verifies repeatability), then apply `supabase/seed_demo.sql`. The seed now contains the 87-entry personal exercise catalog, but deactivates the old demonstration program. Only walking starts as `allowed`; running, jump rope, tennis and padel start as `blocked`; all other cards require manual review before a new program can use them.
-3. Start the API with `python3 app.py` (127.0.0.1:8001). For deployment use `gunicorn app:app` and the hosting platform's environment variables.
-4. Serve `docs/` as static files, for example `python3 -m http.server 8000 --directory docs`. Set `DASHBOARD_ORIGIN` to that origin and enter the API URL/key in Settings.
-5. Use HTTPS for a deployed PWA. A new workout needs network; an already started workout can continue offline with durable local writes.
+2. Apply `supabase/schema.sql` twice (the second pass verifies repeatability), then apply `supabase/seed_production.sql`. The production seed loads the 87-entry personal exercise catalog and real profile without creating or activating a demonstration program. Only walking starts as `allowed`; running, jump rope, tennis and padel start as `blocked`; all other cards require manual review before a new program can use them. Use `supabase/seed_demo.sql` only for an isolated demo database.
+   For a deliberate clean installation that deletes all existing Personal Gym records first, run `supabase/reset_production.sql` instead of those two files.
+3. Apply `supabase/activate_pilot_program.sql` to approve the 10 pilot exercises and activate the Monday/Wednesday/Saturday program. This file is repeatable, but it must be applied again after any later run of the production seed. The pilot contains real user data while its deterministic check-in thresholds still require separate clinical approval, so the PWA labels it `ПИЛОТ`.
+4. Start the API with `python3 app.py` (127.0.0.1:8001). For deployment use `gunicorn app:app` and the hosting platform's environment variables.
+5. Serve `docs/` as static files, for example `python3 -m http.server 8000 --directory docs`. Set `DASHBOARD_ORIGIN` to that origin and enter the API URL/key in Settings.
+6. Use HTTPS for a deployed PWA. A new workout needs network; an already started workout can continue offline with durable local writes.
 
 Read [API and integration decisions](docs/api-integration.md) for payloads, recovery, concurrency and rollout details.
+
+## Active pilot program
+
+`supabase/activate_pilot_program.sql` creates the repeatable 2–3 week pilot:
+
+| Day | Session | Plan |
+|---|---|---|
+| Monday | Full body A | Warm-up, Bird dog, glute bridge, band row, knee push-up, band lateral walk, Pallof press |
+| Wednesday | Full body B + back | Warm-up, dead bug, band lateral walk, band row, band chest press, glute bridge, Pallof press |
+| Saturday | Easy cardio | 20 minutes of walking |
+
+The migration sets 10 selected cards to `allowed`, keeps running, jump rope, tennis, padel and free handstand `blocked`, and returns every other active card to `needs_review`. It deactivates the previous program only inside the transaction and then activates the pilot as the sole active version. Database guards reject activation if any program exercise is inactive or not `allowed`.
+
+The pilot uses real user records (`demo_only=false`) but keeps explicitly labeled pilot check-in rules. The `ПИЛОТ` badge means “operational trial”, not medical approval. On the Program screen, approved cards are under the `Разрешено` filter; the default filter remains `Нужно разобрать`.
 
 ## Optional push worker
 
@@ -35,7 +51,7 @@ node --check docs/app.js
 node --check docs/data.js
 ```
 
-Catalog presence is not medical approval. Exercise status changes are manual; doses and check-in thresholds remain demonstration-only pending separate approval. Secrets and real health data do not belong in Git. Local tests and the browser walkthrough use synthetic workout data.
+Catalog presence is not medical approval. Pilot exercise statuses and doses are explicitly selected by `activate_pilot_program.sql`; check-in thresholds remain pilot-only pending separate approval. Secrets and real health data do not belong in Git. Local tests and the browser walkthrough use synthetic workout data.
 
 ## Exercise library and quick logging
 

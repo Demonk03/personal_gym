@@ -1,6 +1,6 @@
 # Frontend/API contract — design integration
 
-The authoritative rules are `training.py` / `demo-rules-v1`. The HTML design runtime is not used by the application. `docs/index.html` loads the standalone vanilla-JS PWA. All personal API calls use Bearer authentication and `no-store`.
+The authoritative rules are implemented in `training.py`. `demo-rules-v1` is used only by the synthetic demo; the active real-data trial uses `pilot-rules-v1`. Both currently share the same deterministic thresholds, but pilot metadata is preserved through check-in results and rendered honestly in the PWA. The HTML design runtime is not used by the application. `docs/index.html` loads the standalone vanilla-JS PWA. All personal API calls use Bearer authentication and `no-store`.
 
 ## Read models
 
@@ -44,6 +44,7 @@ Every workout entry stores `definition_snapshot` (`id`, name, format and note). 
 - Dates, quantities, mode reasons, comparisons and charts derive from saved data; no prototype constants become production records.
 - Removing an exercise and skipping it are separate operations. A skipped or partially completed exercise makes completion early.
 - The theme and display units are local preferences. Schedule editing stays disabled until a program is approved, as specified in the handoff.
+- Program badges come from rule metadata: `pilot-rules-v1` is displayed as `ПИЛОТ`, synthetic programs as `ДЕМО`, and only separately approved non-pilot programs as `ПРОГРАММА`.
 
 ## Offline and concurrency
 
@@ -57,8 +58,8 @@ The service worker caches only the application shell and Onest font responses; i
 
 ## Delivery boundary
 
-Schema changes are repeatable in `supabase/schema.sql` and were checked using PGlite. Apply the updated schema to the target Supabase project before running this frontend against it. The local demo uses MemoryRepository and synthetic data. No migration, deployment or notification delivery to a real device was performed as part of local implementation.
+Schema changes are repeatable in `supabase/schema.sql` and were checked using PGlite. The production API and PWA are reachable, and the pilot implementation is in `main`; `activate_pilot_program.sql` still needs to be applied to the target Supabase project. The local demo continues to use MemoryRepository and synthetic data. Real-device workout and notification delivery have not yet been verified.
 
-Migration order for this release: apply `schema.sql` twice, apply the catalog seed, confirm 87 active cards (1 allowed, 4 blocked), confirm the old demo program is inactive, manually review desired program cards, and only then activate a replacement program. Existing workout history remains readable from snapshots.
+Migration order for this release: apply `schema.sql` twice, apply `seed_production.sql`, then apply the repeatable `activate_pilot_program.sql`. Before the pilot migration the production seed has 87 active cards (1 allowed, 4 blocked) and no active demo program. After it, verify 10 `allowed`, 5 `blocked`, one active non-demo program using `pilot-rules-v1`, and sessions on ISO weekdays 1, 3 and 6 with 7, 7 and 1 exercises. Reapply the pilot migration after any later production seed. `seed_demo.sql` is only for an isolated demo database. Existing workout history remains readable from snapshots.
 
 Push requires pywebpush, VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY, VAPID_SUBJECT and a scheduler invoking `python3 jobs.py` every minute. Next-day reminders become due at 09:00 local the following morning; the preceding week's review is generated Monday at/after 09:00. Failed notifications retry; expired subscriptions are disabled. Notification text contains no health information. Delivery is at-least-once after an ambiguous network failure; stable notification tags coalesce repeats on the device.
