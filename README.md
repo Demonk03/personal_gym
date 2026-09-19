@@ -22,6 +22,12 @@ Open http://127.0.0.1:8774. In Settings, use that server address and the **test-
 
 Read [API and integration decisions](docs/api-integration.md) for payloads, recovery, concurrency and rollout details.
 
+## Publishing the PWA
+
+The production frontend is [Personal Gym on GitHub Pages](https://demonk03.github.io/personal_gym/). GitHub Pages publishes the `/docs` directory from `main` automatically after a push to `main`. `main` is the single source branch for the frontend; no separate release branch or manual publishing step is used.
+
+Work on `main` locally and push when the intended group of changes is ready. Before pushing, review the files in the commit and run the verification commands below. After pushing, check that the GitHub Pages build succeeded and that the production URL serves the updated files. Backend deployment to Railway is separate from this frontend publication.
+
 ## Active pilot program
 
 `supabase/activate_pilot_program.sql` creates the repeatable 2–3 week pilot:
