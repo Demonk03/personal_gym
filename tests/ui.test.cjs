@@ -10,11 +10,20 @@ test('exercise library interface exposes quick entry, statuses, and all measurem
  assert.match(source,/data-action="catalog-edit"/);assert.match(source,/'create-exercise'/);
 });
 
-test('program badge labels pilot rules honestly on both program surfaces',()=>{
+test('program badge labels pilot rules honestly on the program screen',()=>{
  const source=fs.readFileSync(path.join(__dirname,'../docs/app.js'),'utf8');
  assert.match(source,/const programBadge=/);
  assert.match(source,/pilot-rules-v1.*ПИЛОТ/);
- assert.equal((source.match(/programBadge\(boot\.program\)/g)||[]).length,2);
+ assert.equal((source.match(/programBadge\(boot\.program\)/g)||[]).length,1);
+});
+
+test('nearest workout moves to the next calendar date after the planned session is finished',async()=>{
+ const {nextScheduledSession}=await import('../docs/data.js');
+ const sessions=[{session_id:'sat',weekday:6},{session_id:'mon',weekday:1}];
+ assert.deepEqual(nextScheduledSession(sessions,[],'2026-09-19'),{session:sessions[0],date:'2026-09-19',isToday:true});
+ assert.deepEqual(nextScheduledSession(sessions,[{program_session_id:'sat',scheduled_date:'2026-09-19',status:'completed',is_extra:false}],'2026-09-19'),{session:sessions[1],date:'2026-09-21',isToday:false});
+ assert.equal(nextScheduledSession([sessions[0]],[{program_session_id:'sat',scheduled_date:'2026-09-19',status:'stopped_early'}],'2026-09-19').date,'2026-09-26');
+ assert.equal(nextScheduledSession(sessions,[{program_session_id:'sat',scheduled_date:'2026-09-19',status:'completed',is_extra:true}],'2026-09-19').isToday,true);
 });
 
 test('queue keeps a new set added while previous request is in flight',async()=>{
