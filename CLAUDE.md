@@ -1,5 +1,10 @@
 # Personal Gym — Project Context
 
+## Git workflow
+
+- `main` is the only working and publishing branch. Make commits directly on `main` and push only to `origin/main`; do not create or use feature branches or pull-request branches for this project.
+- Before pushing, verify the relevant changes and confirm that the push is a normal fast-forward. Never force-push or overwrite unrelated local changes. If `origin/main` has moved, stop and reconcile safely.
+
 ## Purpose
 
 Private single-user training PWA. Product requirements live in `SPEC.md`; architecture and implementation plan live under `docs/superpowers/`.
