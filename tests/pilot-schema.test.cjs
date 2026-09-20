@@ -8,6 +8,7 @@ const root = path.resolve(__dirname, "..");
 const schema = fs.readFileSync(path.join(root, "supabase/schema.sql"), "utf8");
 const seed = fs.readFileSync(path.join(root, "supabase/seed_demo.sql"), "utf8");
 const pilot = fs.readFileSync(path.join(root, "supabase/activate_pilot_program.sql"), "utf8");
+const removeCardio = fs.readFileSync(path.join(root, "supabase/remove_scheduled_cardio.sql"), "utf8");
 
 test("pilot migration is repeatable and activates only allowed exercises", async () => {
   const db = new PGlite();
@@ -71,5 +72,41 @@ test("two-session pilot keeps the previous cardio session for workout history", 
     assert.equal((await db.query(`select session_key from program_sessions where id='72000000-0000-4000-8000-000000000003'`)).rows[0].session_key, 'easy-cardio-pilot');
     assert.equal((await db.query(`select program_session_id from workouts where id='74000000-0000-4000-8000-000000000001'`)).rows[0].program_session_id,
       '72000000-0000-4000-8000-000000000003');
+  } finally { await db.close(); }
+});
+
+test("focused cardio removal preserves custom exercise status and old workouts", async () => {
+  const db = new PGlite();
+  try {
+    await db.exec(schema);
+    await db.exec(seed);
+    await db.exec(`update exercise_library set review_status='allowed' where id in ('bird-dog','band-row');
+      update exercise_library set review_status='blocked' where id='walk-easy';
+      insert into program_versions(id,version,name,rule_version,demo_only,approved,active)
+      values('71000000-0000-4000-8000-000000000001',2,'Previous pilot','pilot-rules-v1',false,true,true);
+      insert into program_sessions(id,program_version_id,session_key,name,session_type,weekday,estimated_minutes,position)
+      values
+      ('72000000-0000-4000-8000-000000000001','71000000-0000-4000-8000-000000000001','full-body-a-pilot','Custom A','full_body',1,30,1),
+      ('72000000-0000-4000-8000-000000000002','71000000-0000-4000-8000-000000000001','full-body-b-pilot','Custom B','full_body',3,30,2),
+      ('72000000-0000-4000-8000-000000000003','71000000-0000-4000-8000-000000000001','easy-cardio-pilot','Спокойное кардио','cardio',6,20,3);
+      insert into program_session_exercises(id,session_id,exercise_id,position,planned_sets,planned_reps)
+      values
+      ('73000000-0000-4000-8000-000000000001','72000000-0000-4000-8000-000000000001','bird-dog',1,2,8),
+      ('73000000-0000-4000-8000-000000000002','72000000-0000-4000-8000-000000000002','band-row',1,2,8);
+      insert into workouts(id,program_version_id,program_session_id,status,checkin_mode,rule_version,program_snapshot)
+      values('74000000-0000-4000-8000-000000000001','71000000-0000-4000-8000-000000000001',
+        '72000000-0000-4000-8000-000000000003','completed','green','pilot-rules-v1','{}');`);
+    await db.exec(removeCardio);
+    await db.exec(removeCardio);
+    const sessions = await db.query(`select session_key,name from program_sessions
+      where program_version_id='71000000-0000-4000-8000-000000000002' order by position`);
+    assert.deepEqual(sessions.rows,[
+      {session_key:'full-body-a-pilot',name:'Custom A'},
+      {session_key:'full-body-b-pilot',name:'Custom B'},
+    ]);
+    assert.equal((await db.query(`select review_status from exercise_library where id='walk-easy'`)).rows[0].review_status,'blocked');
+    assert.equal((await db.query(`select count(*)::int as count from program_session_exercises pse join program_sessions ps on ps.id=pse.session_id
+      where ps.program_version_id='71000000-0000-4000-8000-000000000002'`)).rows[0].count,2);
+    assert.equal((await db.query(`select count(*)::int as count from workouts where program_session_id='72000000-0000-4000-8000-000000000003'`)).rows[0].count,1);
   } finally { await db.close(); }
 });
