@@ -9,7 +9,7 @@ from uuid import uuid4
 
 
 REQUIRED_CHECKIN_FIELDS = {
-    "back_pain", "pain_change", "leg_symptoms", "systemic_symptoms",
+    "back_pain", "pain_change",
     "readiness", "location", "equipment",
 }
 PAIN_CHANGES = {"better", "same", "worse"}
@@ -42,24 +42,24 @@ def _valid_checkin(checkin: dict[str, Any]) -> tuple[bool, list[str]]:
         errors.append("invalid:equipment")
     elif len(equipment) != len(set(equipment)):
         errors.append("invalid:equipment")
-    if not isinstance(leg, dict):
+    if leg is not None and not isinstance(leg, dict):
         errors.append("invalid:leg_symptoms")
-    else:
-        if leg.get("trend") not in LEG_TRENDS:
+    elif leg is not None:
+        if "trend" in leg and leg["trend"] not in LEG_TRENDS:
             errors.append("invalid:leg_symptoms.trend")
-        if leg.get("weakness") not in WEAKNESS_LEVELS:
+        if "weakness" in leg and leg["weakness"] not in WEAKNESS_LEVELS:
             errors.append("invalid:leg_symptoms.weakness")
         for field in ("bilateral", "saddle_numbness", "bladder_bowel_change"):
-            if not isinstance(leg.get(field), bool):
+            if field in leg and not isinstance(leg[field], bool):
                 errors.append(f"invalid:leg_symptoms.{field}")
-    if not isinstance(systemic, dict):
+    if systemic is not None and not isinstance(systemic, dict):
         errors.append("invalid:systemic_symptoms")
-    else:
+    elif systemic is not None:
         for field in (
             "unusual_weakness", "dizziness", "palpitations",
             "active_or_worsening_bleeding", "fainting", "severe_shortness_of_breath",
         ):
-            if not isinstance(systemic.get(field), bool):
+            if field in systemic and not isinstance(systemic[field], bool):
                 errors.append(f"invalid:systemic_symptoms.{field}")
     return not errors, errors
 
@@ -81,20 +81,20 @@ def evaluate_checkin(checkin: dict[str, Any], rules: dict[str, Any]) -> dict[str
     }
     if not valid:
         return result
-    leg = checkin["leg_symptoms"]
-    systemic = checkin["systemic_symptoms"]
+    leg = checkin.get("leg_symptoms") or {}
+    systemic = checkin.get("systemic_symptoms") or {}
     red_reasons = []
-    if leg["weakness"] == "severe":
+    if leg.get("weakness") == "severe":
         red_reasons.append("red:severe_leg_weakness")
-    if leg["bilateral"] and leg["trend"] in {"new", "worse"}:
+    if leg.get("bilateral") and leg.get("trend") in {"new", "worse"}:
         red_reasons.append("red:bilateral_leg_symptoms")
-    if leg["saddle_numbness"]:
+    if leg.get("saddle_numbness"):
         red_reasons.append("red:saddle_numbness")
-    if leg["bladder_bowel_change"]:
+    if leg.get("bladder_bowel_change"):
         red_reasons.append("red:bladder_bowel_change")
-    if systemic["fainting"]:
+    if systemic.get("fainting"):
         red_reasons.append("red:fainting")
-    if systemic["severe_shortness_of_breath"]:
+    if systemic.get("severe_shortness_of_breath"):
         red_reasons.append("red:severe_shortness_of_breath")
     if red_reasons:
         return {**result, "mode": "red", "reasons": red_reasons, "blocks_workout": True}
@@ -104,14 +104,14 @@ def evaluate_checkin(checkin: dict[str, Any], rules: dict[str, Any]) -> dict[str
         yellow_reasons.append("yellow:elevated_back_pain")
     if checkin["pain_change"] == "worse":
         yellow_reasons.append("yellow:back_pain_worse")
-    if leg["trend"] in {"new", "worse"}:
+    if leg.get("trend") in {"new", "worse"}:
         yellow_reasons.append("yellow:leg_symptoms_worse")
-    if leg["weakness"] == "mild":
+    if leg.get("weakness") == "mild":
         yellow_reasons.append("yellow:mild_leg_weakness")
     if checkin["readiness"] <= int(yellow.get("readiness_at_most", 2)):
         yellow_reasons.append("yellow:low_readiness")
     for field in ("unusual_weakness", "dizziness", "palpitations", "active_or_worsening_bleeding"):
-        if systemic[field]:
+        if systemic.get(field):
             yellow_reasons.append(f"yellow:{field}")
     if yellow_reasons:
         return {**result, "mode": "yellow", "reasons": yellow_reasons}

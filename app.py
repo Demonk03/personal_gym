@@ -455,6 +455,27 @@ def create_app(repository=None, weekly_review_service=None) -> Flask:
         )
         return jsonify(result)
 
+    @app.post("/api/workouts/<workout_id>/commit-offline")
+    @require_api_key
+    def commit_offline_workout(workout_id):
+        payload, operation_id, digest = mutation_payload()
+        clean_id = _uuid(workout_id, "workout_id")
+        clean = {
+            "revision": _integer(payload, "revision", 1, 1_000_000),
+            "status": _text(payload, "status", required=True, max_length=30),
+            "finished_at": _timestamp(payload, "finished_at"),
+            "stop_reason": _text(payload, "stop_reason", max_length=500) or None,
+            "post_checkin": _post_checkin(payload.get("post_checkin")),
+            "entries": payload.get("entries"), "sets": payload.get("sets"),
+        }
+        if clean["status"] not in {"completed", "stopped_early"}:
+            raise APIError("Некорректный статус завершения")
+        try:
+            result = repo().commit_offline_workout(operation_id, digest, clean_id, clean)
+        except ValueError as error:
+            raise APIError(str(error), 422, "invalid_offline_snapshot") from None
+        return jsonify(result)
+
     @app.post("/api/workouts/<workout_id>/cancel")
     @require_api_key
     def cancel_workout(workout_id):

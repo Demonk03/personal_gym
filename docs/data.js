@@ -21,6 +21,16 @@ export class Store{
  async open(){this.db=await new Promise((resolve,reject)=>{const r=indexedDB.open(this.name,1);r.onupgradeneeded=()=>r.result.createObjectStore('data');r.onsuccess=()=>resolve(r.result);r.onerror=()=>reject(r.error)});return this}
  async get(key){return new Promise((resolve,reject)=>{const t=this.db.transaction('data'),r=t.objectStore('data').get(key);r.onsuccess=()=>resolve(r.result);r.onerror=()=>reject(r.error)})}
  async update(key,fn){return new Promise((resolve,reject)=>{const t=this.db.transaction('data','readwrite'),o=t.objectStore('data'),r=o.get(key);let value;r.onsuccess=()=>{try{value=fn(r.result);o.put(value,key)}catch(e){t.abort();reject(e)}};t.oncomplete=()=>resolve(value);t.onerror=()=>reject(t.error);t.onabort=()=>reject(t.error)})}
+ async updateOwned(key,owner,generation,fn){return new Promise((resolve,reject)=>{
+  const t=this.db.transaction('data','readwrite'),o=t.objectStore('data');let value,failed=false;
+  o.get('writer').onsuccess=event=>{const lease=event.target.result;
+   if(lease?.owner!==owner||lease.generation!==generation||lease.expires<=Date.now()){
+    failed=true;t.abort();reject(new Error('Запись открыта в другой вкладке'));return;
+   }
+   o.get(key).onsuccess=row=>{try{value=fn(row.target.result);o.put(value,key)}catch(error){failed=true;t.abort();reject(error)}};
+  };
+  t.oncomplete=()=>resolve(value);t.onerror=()=>{if(!failed)reject(t.error)};t.onabort=()=>{if(!failed)reject(t.error)};
+ })}
  async set(key,value){return new Promise((resolve,reject)=>{const t=this.db.transaction('data','readwrite');t.objectStore('data').put(value,key);t.oncomplete=()=>resolve();t.onerror=()=>reject(t.error);t.onabort=()=>reject(t.error)})}
 }
 export function project(bundle,queue){
@@ -72,11 +82,11 @@ export class Queue{
 }
 
 export function claimLease(current,owner,now,takeover=false){
- if(takeover||!current||current.expires<=now||current.owner===owner)return {owner,expires:now+15000};return current;
+ if(takeover||!current||current.expires<=now||current.owner===owner)return {owner,expires:now+15000,generation:current?.owner===owner&&!takeover?(current.generation||1):(current?.generation||0)+1};return current;
 }
 export class TabLease{
  constructor(store,onLost){this.store=store;this.owner=uuid();this.onLost=onLost;this.owned=false}
- async acquire(takeover=false){const row=await this.store.update('writer',old=>claimLease(old,this.owner,Date.now(),takeover));const owned=row.owner===this.owner;if(this.owned&&!owned)this.onLost();this.owned=owned;return owned}
+ async acquire(takeover=false){const row=await this.store.update('writer',old=>claimLease(old,this.owner,Date.now(),takeover));const owned=row.owner===this.owner;if(this.owned&&!owned)this.onLost();this.owned=owned;this.generation=owned?row.generation:null;return owned}
  start(){this.timer=setInterval(()=>{if(this.owned)void this.acquire()},5000)}
  stop(){clearInterval(this.timer);this.owned=false}
 }

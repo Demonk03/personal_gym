@@ -17,6 +17,42 @@ test('program badge labels pilot rules honestly on the program screen',()=>{
  assert.equal((source.match(/programBadge\(boot\.program\)/g)||[]).length,1);
 });
 
+test('today weight can collapse and usual pain skips optional symptom questions',()=>{
+ const source=fs.readFileSync(path.join(__dirname,'../docs/app.js'),'utf8');
+ assert.match(source,/link\(weightOpen\?'Свернуть':'Записать','weight-toggle'\)/);
+ assert.match(source,/choices\('Боль в спине\/ногах'/);
+ assert.match(source,/ci\.pain_change!=='same'/);
+ assert.match(source,/choices\('Симптомы в ноге'.*false\)/);
+ assert.match(source,/choices\('Слабость в ноге'.*false\)/);
+ assert.doesNotMatch(source,/choices\('Онемение в области промежности'|<h2>Необычные ощущения<\/h2>/);
+ assert.match(source,/pain_change==='same'\?\{\}:\{leg_symptoms:/);
+});
+
+test('pre-workout form uses saved equipment without asking for confirmation',()=>{
+ const source=fs.readFileSync(path.join(__dirname,'../docs/app.js'),'utf8');
+ const form=source.slice(source.indexOf('function checkinView()'),source.indexOf('function planView()'));
+ assert.doesNotMatch(form,/Доступное оборудование|Оборудование указано верно|equipment_confirmed/);
+ assert.doesNotMatch(source,/if\(action==='equipment'\)/);
+ assert.match(source,/ci=\{equipment:boot\.profile\?\.equipment\|\|\[\]\}/);
+ assert.match(source,/equipment:equipment\?\?boot\.profile\?\.equipment\?\?\[\]/);
+});
+
+test('offline workout routes local actions to a draft until one final commit',async()=>{
+ const source=fs.readFileSync(path.join(__dirname,'../docs/app.js'),'utf8');
+ assert.match(source,/format:'offline-atomic-v1'/);
+ assert.match(source,/if\(offline\?\.state==='recording'\)\{await updateOffline\(d=>\{d\.bundle\.sets\.push/);
+ assert.match(source,/commit-offline/);
+ assert.match(source,/if\(offline\?\.state==='recording'\)\{await updateOffline\(d=>\{const id=uuid\(\)/);
+ assert.match(source,/if\(day\.active&&!pending\.length&&!offline\)/);
+ assert.match(source,/Открыть тренировку','take-over'/);
+ assert.match(source,/sheet\.kind==='catalog-edit'\?link\('Свернуть','sheet-close'\)/);
+ const takeover=source.slice(source.indexOf("if(action==='take-over')"),source.indexOf("if(action==='retry-offline')"));
+ assert.doesNotMatch(takeover,/queue\.flush/);
+ const {claimLease}=await import('../docs/data.js');
+ const first=claimLease(null,'one',1000),second=claimLease(first,'two',2000,true);
+ assert.ok(second.generation>first.generation);
+});
+
 test('nearest workout moves to the next calendar date after the planned session is finished',async()=>{
  const {nextScheduledSession}=await import('../docs/data.js');
  const sessions=[{session_id:'sat',weekday:6},{session_id:'mon',weekday:1}];
@@ -86,6 +122,9 @@ test('dependent set waits for quick exercise and preserves operation IDs',async(
 test('tab lease excludes a second writer until takeover or expiration',async()=>{
  const {claimLease}=await import('../docs/data.js');const first=claimLease(null,'one',1000);
  assert.equal(claimLease(first,'two',2000).owner,'one');
- assert.equal(claimLease(first,'two',2000,true).owner,'two');
+ const taken=claimLease(first,'two',2000,true);
+ assert.equal(taken.owner,'two');
+ assert.equal(taken.generation,first.generation+1);
+ assert.equal(claimLease(taken,'one',3000).owner,'two');
  assert.equal(claimLease(first,'two',16001).owner,'two');
 });

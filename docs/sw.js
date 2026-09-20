@@ -1,4 +1,4 @@
-const CACHE='personal-gym-shell-v2';
+const CACHE='personal-gym-shell-v3';
 const SHELL=['./','./index.html','./style.css','./app.js','./data.js','./config.js','./icon.svg','./manifest.json','./fonts/Onest-400.ttf','./fonts/Onest-500.ttf','./fonts/Onest-600.ttf','./fonts/Onest-700.ttf'];
 self.addEventListener('install',e=>e.waitUntil(caches.open(CACHE).then(c=>c.addAll(SHELL))));
 self.addEventListener('activate',e=>e.waitUntil(caches.keys().then(keys=>Promise.all(keys.filter(k=>k.startsWith('personal-gym-shell-')&&k!==CACHE).map(k=>caches.delete(k)))).then(()=>self.clients.claim())));

@@ -68,6 +68,25 @@ def test_incomplete_or_unknown_value_never_returns_green(program):
     assert "invalid:pain_change" in second["reasons"]
 
 
+def test_usual_pain_requires_no_extra_symptom_answers(program):
+    checkin = base_checkin()
+    checkin.pop("leg_symptoms")
+    checkin.pop("systemic_symptoms")
+    result = evaluate_checkin(checkin, program["rules"])
+    assert result["complete"] is True
+    assert result["mode"] == "green"
+
+
+def test_optional_leg_answers_still_affect_evaluation(program):
+    checkin = base_checkin()
+    checkin.pop("systemic_symptoms")
+    checkin["leg_symptoms"] = {"weakness": "severe"}
+    result = evaluate_checkin(checkin, program["rules"])
+    assert result["complete"] is True
+    assert result["blocks_workout"] is True
+    assert "red:severe_leg_weakness" in result["reasons"]
+
+
 def test_pilot_rule_metadata_is_preserved_in_checkin_result():
     result = evaluate_checkin(base_checkin(), demo_rules("pilot-rules-v1"))
 

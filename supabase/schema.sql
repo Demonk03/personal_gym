@@ -928,4 +928,141 @@ begin
 end $$;
 revoke all on function gym_claim_notification(text,text) from public;
 
+create or replace function gym_commit_offline_workout(
+  p_operation_id uuid, p_body_hash text, p_workout_id uuid, p_payload jsonb
+) returns jsonb language plpgsql security definer set search_path=public as $$
+declare
+  claim jsonb; token uuid; w workouts; old_rows jsonb; item jsonb; fact jsonb;
+  old_row jsonb; card exercise_library; definition jsonb; source jsonb;
+  seen_ids uuid[] := '{}'; seen_positions integer[] := '{}';
+  entry_id uuid; chosen text; pos integer; baseline_count integer; matched_count integer := 0;
+  set_type text; result jsonb; equipment jsonb;
+begin
+  claim := gym_claim_operation(p_operation_id,'commit_offline_workout',p_workout_id,p_body_hash);
+  if claim->>'status'<>'claimed' then return claim; end if;
+  token := (claim->>'token')::uuid;
+  select * into w from workouts where id=p_workout_id for update;
+  if w.id is null then raise exception 'workout_not_found'; end if;
+  if w.status<>'in_progress' or w.revision<>(p_payload->>'revision')::integer then
+    raise exception 'revision_conflict';
+  end if;
+  if p_payload->>'status' not in ('completed','stopped_early') then raise exception 'invalid_terminal_status'; end if;
+  if p_payload->>'status'='stopped_early' and coalesce(p_payload->>'stop_reason','')='' then
+    raise exception 'stop_reason_required';
+  end if;
+  if jsonb_typeof(p_payload->'entries')<>'array' or jsonb_typeof(p_payload->'sets')<>'array'
+     or jsonb_array_length(p_payload->'entries')=0 or jsonb_array_length(p_payload->'entries')>100
+     or jsonb_array_length(p_payload->'sets')>500 then raise exception 'invalid_offline_snapshot'; end if;
+  if exists(select 1 from workout_sets where workout_id=p_workout_id)
+     or exists(select 1 from checkins where workout_id=p_workout_id and kind='post') then
+    raise exception 'offline_server_facts_exist'; end if;
+  select count(*), coalesce(jsonb_agg(to_jsonb(e)),'[]'::jsonb) into baseline_count,old_rows
+    from workout_exercises e where e.workout_id=p_workout_id;
+  select coalesce(payload->'equipment','[]'::jsonb) into equipment
+    from checkins where workout_id=p_workout_id and kind='pre';
+  equipment := coalesce(equipment,'[]'::jsonb);
+
+  -- Validate entries and create custom cards before replacing any workout rows.
+  for item in select value from jsonb_array_elements(p_payload->'entries') loop
+    entry_id := (item->>'id')::uuid;
+    pos := (item->>'position')::integer;
+    if entry_id=any(seen_ids) or pos=any(seen_positions) or pos<1
+       or jsonb_typeof(item->'removed')<>'boolean' or jsonb_typeof(item->'skipped')<>'boolean' then
+      raise exception 'invalid_offline_entry'; end if;
+    seen_ids := array_append(seen_ids,entry_id);
+    seen_positions := array_append(seen_positions,pos);
+    select value into old_row from jsonb_array_elements(old_rows) where value->>'id'=entry_id::text;
+    if old_row is not null then
+      matched_count := matched_count+1;
+      chosen := item->>'exercise_id';
+      if chosen is null then raise exception 'invalid_offline_exercise'; end if;
+      if chosen<>old_row->>'exercise_id' then
+        if coalesce((old_row->>'is_ad_hoc')::boolean,false) then raise exception 'replacement_not_allowed'; end if;
+        select value into source from jsonb_array_elements(w.program_snapshot->'exercises')
+          where value->>'exercise_id'=old_row->>'original_exercise_id';
+        definition := w.program_snapshot->'exercise_library'->chosen;
+        if source is null or not coalesce(source->'allowed_replacements','[]'::jsonb) ? chosen
+           or definition is null or definition->>'review_status'<>'allowed'
+           or not coalesce((definition->>'active')::boolean,true)
+           or not equipment @> coalesce(definition->'equipment','[]'::jsonb)
+           or definition->>'measurement_type'<>old_row->'definition_snapshot'->>'measurement_type'
+        then raise exception 'replacement_not_allowed'; end if;
+      end if;
+    else
+      chosen := item->'exercise'->>'id';
+      if chosen is null then raise exception 'invalid_offline_exercise'; end if;
+      select * into card from exercise_library where id=chosen for update;
+      if card.id is null then
+        if chosen !~ '^custom-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+          then raise exception 'exercise_not_found'; end if;
+        insert into exercise_library(id,name,measurement_type,note,source,review_status,demo_only,active)
+          values(chosen,item->'exercise'->>'name',item->'exercise'->>'measurement_type',
+            coalesce(item->'exercise'->>'note',''),'quick_user_entry','needs_review',false,true)
+          returning * into card;
+      elsif not card.active or card.review_status='blocked' then raise exception 'exercise_unavailable'; end if;
+    end if;
+  end loop;
+  if matched_count<>baseline_count or array_length(seen_positions,1)<>jsonb_array_length(p_payload->'entries')
+     or (select max(v) from unnest(seen_positions) v)<>jsonb_array_length(p_payload->'entries') then
+    raise exception 'invalid_offline_entries'; end if;
+
+  delete from workout_sets where workout_id=p_workout_id;
+  delete from workout_exercises where workout_id=p_workout_id;
+  for item in select value from jsonb_array_elements(p_payload->'entries') loop
+    entry_id := (item->>'id')::uuid;
+    select value into old_row from jsonb_array_elements(old_rows) where value->>'id'=entry_id::text;
+    chosen := coalesce(item->>'exercise_id',item->'exercise'->>'id');
+    if old_row is null then
+      select * into card from exercise_library where id=chosen;
+      definition := jsonb_build_object('id',card.id,'name',card.name,
+        'measurement_type',card.measurement_type,'note',card.note);
+    elsif chosen=old_row->>'exercise_id' then definition := old_row->'definition_snapshot';
+    else definition := jsonb_build_object('id',chosen,
+      'name',w.program_snapshot->'exercise_library'->chosen->>'name',
+      'measurement_type',w.program_snapshot->'exercise_library'->chosen->>'measurement_type',
+      'note',coalesce(w.program_snapshot->'exercise_library'->chosen->>'note','')); end if;
+    insert into workout_exercises(id,workout_id,original_exercise_id,exercise_id,position,
+      planned_sets,planned_reps,planned_seconds,planned_weight_kg,replacement_reason,
+      definition_snapshot,is_ad_hoc,removed,skipped,skip_reason,revision)
+    values(entry_id,p_workout_id,coalesce(old_row->>'original_exercise_id',chosen),chosen,
+      (item->>'position')::integer,(old_row->>'planned_sets')::integer,
+      (old_row->>'planned_reps')::integer,(old_row->>'planned_seconds')::integer,
+      (old_row->>'planned_weight_kg')::numeric,
+      case when old_row is not null and chosen<>old_row->>'exercise_id' then 'Выбрана разрешённая замена'
+           else old_row->>'replacement_reason' end,definition,old_row is null or coalesce((old_row->>'is_ad_hoc')::boolean,false),
+      (item->>'removed')::boolean,(item->>'skipped')::boolean,old_row->>'skip_reason',
+      coalesce((old_row->>'revision')::integer,1));
+  end loop;
+  for fact in select value from jsonb_array_elements(p_payload->'sets') loop
+    select e.definition_snapshot->>'measurement_type' into set_type
+      from workout_exercises e where e.id=(fact->>'workout_exercise_id')::uuid and e.workout_id=p_workout_id
+        and not e.removed and not e.skipped;
+    if set_type is null then raise exception 'invalid_offline_set'; end if;
+    if not coalesce(((set_type='reps' and (fact->>'actual_reps')::integer>0 and fact->>'actual_seconds' is null and fact->>'actual_weight_kg' is null)
+      or (set_type='seconds' and fact->>'actual_reps' is null and (fact->>'actual_seconds')::integer>0 and fact->>'actual_weight_kg' is null)
+      or (set_type='weighted_reps' and (fact->>'actual_reps')::integer>0 and fact->>'actual_seconds' is null and (fact->>'actual_weight_kg')::numeric>=0)
+      or (set_type='reps_seconds' and (fact->>'actual_reps')::integer>0 and (fact->>'actual_seconds')::integer>0 and fact->>'actual_weight_kg' is null)),false) then
+      raise exception 'measurement_mismatch'; end if;
+    insert into workout_sets(id,workout_id,workout_exercise_id,set_number,
+      actual_reps,actual_seconds,actual_weight_kg,completed_at)
+    values((fact->>'id')::uuid,p_workout_id,(fact->>'workout_exercise_id')::uuid,
+      (fact->>'set_number')::integer,(fact->>'actual_reps')::integer,
+      (fact->>'actual_seconds')::integer,(fact->>'actual_weight_kg')::numeric,
+      (fact->>'completed_at')::timestamptz);
+  end loop;
+  if p_payload->>'status'='completed' and exists(select 1 from workout_exercises e
+    where e.workout_id=p_workout_id and not e.removed and not e.is_ad_hoc and
+      (e.skipped or (select count(*) from workout_sets s where s.workout_exercise_id=e.id)<e.planned_sets))
+  then raise exception 'incomplete_workout'; end if;
+  insert into checkins(id,workout_id,kind,checkin_date,payload)
+    values(gen_random_uuid(),p_workout_id,'post',(p_payload->>'finished_at')::timestamptz::date,p_payload->'post_checkin');
+  update workouts set status=p_payload->>'status',finished_at=(p_payload->>'finished_at')::timestamptz,
+    stop_reason=p_payload->>'stop_reason',revision=revision+1,updated_at=now()
+    where id=p_workout_id returning * into w;
+  result := jsonb_build_object('workout_id',w.id,'status',w.status,'revision',w.revision);
+  perform gym_commit_operation(p_operation_id,token,result);
+  return jsonb_build_object('status','succeeded','result',result);
+end $$;
+revoke all on function gym_commit_offline_workout(uuid,text,uuid,jsonb) from public;
+
 commit;

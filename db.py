@@ -190,6 +190,13 @@ class SupabaseRepository:
                 raise Conflict("unique_conflict") from error
             if "revision_conflict" in message:
                 raise RevisionConflict("revision_conflict") from error
+            if name == "gym_commit_offline_workout" and any(code_name in message for code_name in (
+                "invalid_offline_snapshot", "invalid_offline_entry", "invalid_offline_entries",
+                "invalid_offline_exercise", "invalid_offline_set", "invalid_terminal_status",
+                "stop_reason_required", "measurement_mismatch", "incomplete_workout",
+                "exercise_not_found", "replacement_not_allowed", "exercise_unavailable",
+            )):
+                raise ValueError(message) from error
             if any(code in message for code in (
                 "active_workout_exists", "invalid_workout_state", "invalid_exercise_order",
                 "replacement_not_allowed", "checkin_already_exists", "set_already_exists", "exercise_has_sets", "exercise_unavailable", "empty_plan", "invalid_edit", "incomplete_workout",
@@ -244,6 +251,13 @@ class SupabaseRepository:
             "p_operation_id": operation_id, "p_body_hash": payload_hash, "p_workout_id": workout_id,
             "p_revision": revision, "p_status": status, "p_finished_at": finished_at,
             "p_stop_reason": stop_reason, "p_post_checkin": post_checkin,
+        })
+        return self.get_workout(result["workout_id"])
+
+    def commit_offline_workout(self, operation_id, payload_hash, workout_id, payload):
+        result = self._rpc("gym_commit_offline_workout", {
+            "p_operation_id": operation_id, "p_body_hash": payload_hash,
+            "p_workout_id": workout_id, "p_payload": payload,
         })
         return self.get_workout(result["workout_id"])
 
@@ -660,6 +674,49 @@ class MemoryRepository:
             }
             return self.get_workout(workout_id)
         return execute_operation(self, operation_id, "finish_workout", workout_id, payload, finish, payload_hash)
+
+    def commit_offline_workout(self, operation_id, payload_hash, workout_id, payload):
+        from offline_workout import validate_snapshot
+
+        def commit():
+            bundle = self.get_workout(workout_id)
+            if bundle["sets"] or any(c["kind"] == "post" for c in bundle["checkins"]):
+                raise Conflict("offline_server_facts_exist")
+            normalized = validate_snapshot(bundle, payload, self.catalog)
+            now = utc_now()
+            next_catalog = deepcopy(self.catalog)
+            next_exercises = deepcopy(self.exercises)
+            next_sets = deepcopy(self.sets)
+            next_workouts = deepcopy(self.workouts)
+            next_checkins = deepcopy(self.checkins)
+            for card_id, card in normalized["new_cards"].items():
+                next_catalog[card_id] = {
+                    **deepcopy(card), "source": "quick_user_entry", "revision": 1,
+                    "created_at": now, "updated_at": now,
+                }
+            for row in normalized["entries"]:
+                next_exercises[row["id"]] = deepcopy(row)
+            for row in normalized["sets"]:
+                next_sets[row["id"]] = deepcopy(row)
+            workout = next_workouts[workout_id]
+            workout.update(status=payload["status"], finished_at=payload["finished_at"],
+                           stop_reason=payload.get("stop_reason"), revision=workout["revision"] + 1,
+                           updated_at=now)
+            checkin_id = str(uuid4())
+            next_checkins[checkin_id] = {
+                "id": checkin_id, "workout_id": workout_id, "kind": "post",
+                "payload": deepcopy(payload["post_checkin"]), "revision": 1,
+                "created_at": now, "updated_at": now,
+            }
+            self.catalog = next_catalog
+            self.exercises = next_exercises
+            self.sets = next_sets
+            self.workouts = next_workouts
+            self.checkins = next_checkins
+            return self.get_workout(workout_id)
+
+        return execute_operation(self, operation_id, "commit_offline_workout", workout_id,
+                                 payload, commit, payload_hash)
 
     def list_history(self, date_from=None, date_to=None):
         rows = list(self.workouts.values())
