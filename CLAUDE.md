@@ -38,7 +38,7 @@ Apply database files in this order:
 2. `supabase/seed_production.sql`;
 3. `supabase/activate_pilot_program.sql`.
 
-The pilot migration is repeatable and must be rerun after the production seed. It approves 10 pilot exercises, blocks 5 excluded exercises, sets the rest to `needs_review`, and activates sessions on Monday, Wednesday, and Saturday.
+The pilot migration is repeatable and must be rerun after the production seed. It approves 10 pilot exercise cards, blocks 5 excluded exercises, sets the rest to `needs_review`, and activates sessions on Monday and Wednesday only. Ordinary walking is not a scheduled workout; the previous three-session program is retained for historical workout references.
 
 The PWA renders `pilot-rules-v1` as `ПИЛОТ`. Do not replace it with `ПРОГРАММА` until the check-in rules have been separately approved.
 

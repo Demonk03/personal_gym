@@ -38,7 +38,6 @@ test("pilot migration is repeatable and activates only allowed exercises", async
   assert.deepEqual(sessions.rows, [
     {session_key: "full-body-a-pilot", weekday: 1, exercises: 7},
     {session_key: "full-body-b-pilot", weekday: 3, exercises: 7},
-    {session_key: "easy-cardio-pilot", weekday: 6, exercises: 1},
   ]);
 
   const unsafe = await db.query(`select count(*)::int as count
@@ -48,4 +47,29 @@ test("pilot migration is repeatable and activates only allowed exercises", async
     where ps.program_version_id=$1 and (not e.active or e.review_status<>'allowed')`, [active.rows[0].id]);
   assert.equal(unsafe.rows[0].count, 0);
   await db.close();
+});
+
+test("two-session pilot keeps the previous cardio session for workout history", async () => {
+  const db = new PGlite();
+  try {
+    await db.exec(schema);
+    await db.exec(seed);
+    await db.exec(`insert into program_versions(id,version,name,rule_version,demo_only,approved,active)
+      values('71000000-0000-4000-8000-000000000001',2,'Previous pilot','pilot-rules-v1',false,true,true);
+      insert into program_sessions(id,program_version_id,session_key,name,session_type,weekday,estimated_minutes,position)
+      values('72000000-0000-4000-8000-000000000003','71000000-0000-4000-8000-000000000001',
+        'easy-cardio-pilot','Спокойное кардио','cardio',6,20,3);
+      insert into workouts(id,program_version_id,program_session_id,status,checkin_mode,rule_version,program_snapshot)
+      values('74000000-0000-4000-8000-000000000001','71000000-0000-4000-8000-000000000001',
+        '72000000-0000-4000-8000-000000000003','completed','green','pilot-rules-v1','{}');`);
+    await db.exec(pilot);
+    const active = await db.query(`select id from program_versions where active`);
+    assert.equal(active.rows.length, 1);
+    assert.equal(active.rows[0].id, '71000000-0000-4000-8000-000000000002');
+    assert.equal((await db.query(`select count(*)::int as count from program_sessions where program_version_id=$1`,
+      [active.rows[0].id])).rows[0].count, 2);
+    assert.equal((await db.query(`select session_key from program_sessions where id='72000000-0000-4000-8000-000000000003'`)).rows[0].session_key, 'easy-cardio-pilot');
+    assert.equal((await db.query(`select program_session_id from workouts where id='74000000-0000-4000-8000-000000000001'`)).rows[0].program_session_id,
+      '72000000-0000-4000-8000-000000000003');
+  } finally { await db.close(); }
 });
