@@ -76,10 +76,66 @@ class SupabaseRepository:
         try:
             program = self.get_program()
         except NotFound:
-            return {"contract_version": 1, "profile": profile[0] if profile else None, "program": None, "sessions": []}
+            return {"contract_version": 2, "profile": profile[0] if profile else None, "program": None,
+                    "sessions": [], "programs": self.list_programs(), "day_choices": self.list_day_choices()}
         sessions = self.client.table("program_sessions").select("session_key").eq("program_version_id", program["id"]).order("position").execute().data
-        return {"contract_version": 1, "profile": profile[0] if profile else None, "program": program,
-                "sessions": [self.get_program(row["session_key"]) for row in sessions]}
+        return {"contract_version": 2, "profile": profile[0] if profile else None, "program": program,
+                "sessions": [self.get_program(row["session_key"]) for row in sessions],
+                "programs": self.list_programs(), "day_choices": self.list_day_choices()}
+
+    def list_programs(self):
+        versions = self.client.table("program_versions").select("*").eq("published", True).order("version").execute().data
+        result = []
+        for version in versions:
+            sessions = self.client.table("program_sessions").select("*").eq("program_version_id", version["id"]).order("position").execute().data
+            result.append({**version, "sessions": [self.get_program_by_session_id(row["id"]) for row in sessions]})
+        return result
+
+    def list_day_choices(self):
+        return self.client.table("gym_day_choices").select("*").order("scheduled_date").execute().data
+
+    def select_program(self, program_version_id):
+        version = self.client.table("program_versions").select("id").eq("id", program_version_id).eq("published", True).limit(1).execute().data
+        if not version:
+            raise NotFound("program_not_found")
+        row = self.client.table("gym_program_selection").upsert({"id": True, "program_version_id": program_version_id, "updated_at": utc_now()}).execute().data
+        if not row:
+            raise NotFound("program_selection_not_found")
+        return row[0]
+
+    def set_session_weekday(self, session_id, weekday):
+        self.get_program_by_session_id(session_id)
+        self.client.table("gym_session_weekdays").upsert({"session_id": session_id, "weekday": weekday}).execute()
+        return {"session_id": session_id, "weekday": weekday}
+
+    def set_day_choice(self, scheduled_date, choice, session_id=None, assigned_session_id=None):
+        if self.client.table("workouts").select("id").eq("scheduled_date", scheduled_date).neq("status", "cancelled").limit(1).execute().data:
+            raise Conflict("workout_already_exists")
+        row = {"scheduled_date": scheduled_date, "choice": choice, "session_id": session_id,
+               "assigned_session_id": assigned_session_id, "updated_at": utc_now()}
+        return self.client.table("gym_day_choices").upsert(row).execute().data[0]
+
+    def clear_day_choice(self, scheduled_date):
+        self.client.table("gym_day_choices").delete().eq("scheduled_date", scheduled_date).execute()
+        return {"scheduled_date": scheduled_date, "restored": True}
+
+    def resolve_session(self, scheduled_date):
+        choice = self.client.table("gym_day_choices").select("*").eq("scheduled_date", scheduled_date).limit(1).execute().data
+        if choice:
+            if choice[0]["choice"] == "skipped":
+                raise Conflict("scheduled_day_skipped")
+            return {"program": self.get_program_by_session_id(choice[0]["session_id"]),
+                    "assigned_session_id": choice[0].get("assigned_session_id") or choice[0]["session_id"]}
+        selection = self.client.table("gym_program_selection").select("program_version_id").eq("id", True).limit(1).execute().data
+        if not selection:
+            raise NotFound("program_selection_not_found")
+        sessions = self.client.table("program_sessions").select("*").eq("program_version_id", selection[0]["program_version_id"]).order("position").execute().data
+        weekday = date.fromisoformat(scheduled_date).isoweekday()
+        for session in sessions:
+            override = self.client.table("gym_session_weekdays").select("weekday").eq("session_id", session["id"]).limit(1).execute().data
+            if (override[0]["weekday"] if override else session.get("weekday")) == weekday:
+                return {"program": self.get_program_by_session_id(session["id"]), "assigned_session_id": session["id"]}
+        raise NotFound("scheduled_session_not_found")
 
     def list_exercises(self, query=""):
         request = self.client.table("exercise_library").select("*").eq("active", True).order("name")
@@ -105,10 +161,14 @@ class SupabaseRepository:
         return self.get_workout(result["workout_id"])
 
     def get_program(self, session_key: str | None = None) -> dict[str, Any]:
-        versions = self.client.table("program_versions").select("*").eq("active", True).limit(1).execute().data
+        selection = self.client.table("gym_program_selection").select("program_version_id").eq("id", True).limit(1).execute().data
+        versions = (self.client.table("program_versions").select("*").eq("id", selection[0]["program_version_id"]).limit(1).execute().data
+                    if selection else self.client.table("program_versions").select("*").eq("active", True).limit(1).execute().data)
         if not versions:
             raise NotFound("active_program_not_found")
         version = versions[0]
+        if not version.get("published", False):
+            raise NotFound("active_program_not_found")
         query = self.client.table("program_sessions").select("*").eq("program_version_id", version["id"])
         if session_key:
             query = query.eq("session_key", session_key)
@@ -116,14 +176,34 @@ class SupabaseRepository:
         if not sessions:
             raise NotFound("program_session_not_found")
         session = sessions[0]
+        return self._program_session(version, session)
+
+    def get_program_by_session_id(self, session_id):
+        sessions = self.client.table("program_sessions").select("*").eq("id", session_id).limit(1).execute().data
+        if not sessions:
+            raise NotFound("program_session_not_found")
+        session = sessions[0]
+        versions = self.client.table("program_versions").select("*").eq("id", session["program_version_id"]).eq("published", True).limit(1).execute().data
+        if not versions:
+            raise Conflict("program_not_published")
+        return self._program_session(versions[0], session)
+
+    def _program_session(self, version, session):
+        overrides = self.client.table("gym_session_weekdays").select("weekday").eq("session_id", session["id"]).limit(1).execute().data
+        if overrides:
+            session = {**session, "weekday": overrides[0]["weekday"]}
         entries = self.client.table("program_session_exercises").select("*").eq("session_id", session["id"]).order("position").execute().data
         ids = [entry["exercise_id"] for entry in entries]
         exercises = self.client.table("exercise_library").select("*").in_("id", ids).execute().data
-        replacements = self.client.table("exercise_replacements").select("*").in_("exercise_id", ids).execute().data
+        replacements = self.client.table("gym_session_replacements").select("*").in_("session_exercise_id", [e["id"] for e in entries]).execute().data if entries else []
+        if entries and not replacements:
+            legacy = self.client.table("exercise_replacements").select("*").in_("exercise_id", ids).execute().data
+            replacements = [{"session_exercise_id": e["id"], "replacement_id": row["replacement_id"],
+                             "reason": row["reason"]} for e in entries for row in legacy if e["exercise_id"] == row["exercise_id"]]
         replacement_map: dict[str, list[str]] = {}
         replacement_ids = []
         for row in replacements:
-            replacement_map.setdefault(row["exercise_id"], []).append(row["replacement_id"])
+            replacement_map.setdefault(row["session_exercise_id"], []).append(row["replacement_id"])
             replacement_ids.append(row["replacement_id"])
         if replacement_ids:
             exercises += self.client.table("exercise_library").select("*").in_("id", replacement_ids).execute().data
@@ -132,11 +212,12 @@ class SupabaseRepository:
             "id": version["id"], "session_id": session["id"], "session_key": session["session_key"],
             "name": session["name"], "session_type": session["session_type"], "weekday": session["weekday"],
             "estimated_minutes": session["estimated_minutes"], "created_at": version["created_at"],
-            "replacement_reasons": {f'{r["exercise_id"]}:{r["replacement_id"]}': r["reason"] for r in replacements},
+            "replacement_reasons": {f'{next((e["exercise_id"] for e in entries if e["id"] == r["session_exercise_id"]), "")}:{r["replacement_id"]}': r["reason"] for r in replacements},
             "version": version["version"], "rule_version": version["rule_version"],
+            "program_code": version.get("program_code"), "stage_code": version.get("stage_code"),
             "demo_only": version["demo_only"], "rules": demo_rules(version["rule_version"]),
             "exercise_library": library,
-            "exercises": [{**entry, "allowed_replacements": replacement_map.get(entry["exercise_id"], [])} for entry in entries],
+            "exercises": [{**entry, "allowed_replacements": replacement_map.get(entry["id"], [])} for entry in entries],
         }
 
     def get_active_workout(self):
@@ -380,6 +461,10 @@ class MemoryRepository:
 
     def __init__(self, program: dict[str, Any] | None = None):
         self.program = deepcopy(program) if program else None
+        self.programs = [deepcopy(program)] if program else []
+        self.selected_program_id = program.get("id") if program else None
+        self.day_choices = {}
+        self.weekdays = {}
         self.profile = {"id": True, "timezone": "Europe/Belgrade", "demo_only": True, "revision": 1}
         self.workouts: dict[str, dict[str, Any]] = {}
         self.exercises: dict[str, dict[str, Any]] = {}
@@ -414,12 +499,81 @@ class MemoryRepository:
         return deepcopy(row)
 
     def bootstrap(self):
-        return {"contract_version": 1, "profile": deepcopy(self.profile), "program": deepcopy(self.program), "sessions": [deepcopy(self.program)] if self.program else []}
+        return {"contract_version": 2, "profile": deepcopy(self.profile), "program": deepcopy(self.program),
+                "sessions": [deepcopy(item) for item in self.programs if item.get("id") == self.selected_program_id],
+                "programs": self.list_programs(),
+                "day_choices": list(deepcopy(self.day_choices).values())}
 
     def get_program(self, session_key=None):
-        if not self.program or session_key and self.program.get("session_key") != session_key:
+        sessions = [item for item in self.programs if item.get("id") == self.selected_program_id]
+        program = next((item for item in sessions if not session_key or item.get("session_key") == session_key), None)
+        if not program:
             raise NotFound("program_session_not_found")
-        return deepcopy(self.program)
+        return deepcopy(program)
+
+    def get_program_by_session_id(self, session_id):
+        for program in self.programs:
+            if program.get("session_id") == session_id:
+                return deepcopy(program)
+        raise NotFound("program_session_not_found")
+
+    def list_programs(self):
+        result = []
+        for program_id in dict.fromkeys(item.get("id") for item in self.programs):
+            sessions = [deepcopy(item) for item in self.programs if item.get("id") == program_id]
+            if not sessions:
+                continue
+            first = sessions[0]
+            result.append({key: deepcopy(first.get(key)) for key in (
+                "id", "name", "version", "program_code", "stage_code", "rule_version", "demo_only"
+            )} | {"published": True, "sessions": sessions})
+        return result
+
+    def list_day_choices(self):
+        return list(deepcopy(self.day_choices).values())
+
+    def select_program(self, program_version_id):
+        for program in self.programs:
+            if program.get("id") == program_version_id:
+                self.selected_program_id = program_version_id
+                self.program = deepcopy(program)
+                return {"program_version_id": program_version_id}
+        raise NotFound("program_not_found")
+
+    def set_session_weekday(self, session_id, weekday):
+        self.weekdays[session_id] = weekday
+        for program in self.programs:
+            if program.get("session_id") == session_id:
+                program["weekday"] = weekday
+        if self.program and self.program.get("session_id") == session_id:
+            self.program["weekday"] = weekday
+        return {"session_id": session_id, "weekday": weekday}
+
+    def set_day_choice(self, scheduled_date, choice, session_id=None, assigned_session_id=None):
+        if any(w.get("scheduled_date") == scheduled_date and w.get("status") != "cancelled" for w in self.workouts.values()):
+            raise Conflict("workout_already_exists")
+        row = {"scheduled_date": scheduled_date, "choice": choice, "session_id": session_id,
+               "assigned_session_id": assigned_session_id}
+        self.day_choices[scheduled_date] = row
+        return deepcopy(row)
+
+    def clear_day_choice(self, scheduled_date):
+        self.day_choices.pop(scheduled_date, None)
+        return {"scheduled_date": scheduled_date, "restored": True}
+
+    def resolve_session(self, scheduled_date):
+        choice = self.day_choices.get(scheduled_date)
+        if choice:
+            if choice["choice"] == "skipped":
+                raise Conflict("scheduled_day_skipped")
+            return {"program": self.get_program_by_session_id(choice["session_id"]),
+                    "assigned_session_id": choice.get("assigned_session_id") or choice["session_id"]}
+        weekday = date.fromisoformat(scheduled_date).isoweekday()
+        candidates = [program for program in self.programs if program.get("id") == self.selected_program_id]
+        program = next((item for item in candidates if self.weekdays.get(item.get("session_id"), item.get("weekday")) == weekday), None)
+        if not program:
+            raise NotFound("scheduled_session_not_found")
+        return {"program": deepcopy(program), "assigned_session_id": program["session_id"]}
 
     def claim_operation(self, operation_id, kind, resource_id, payload_hash):
         existing = self.operations.get(operation_id)
@@ -494,13 +648,14 @@ class MemoryRepository:
             self.workouts[workout["id"]] = deepcopy(workout)
             for item in exercises:
                 self.exercises[item["id"]] = {**deepcopy(item), "workout_id": workout["id"], "revision": 1, "skipped": False}
-            checkin_id = str(uuid4())
-            self.checkins[checkin_id] = {
-                "id": checkin_id, "workout_id": workout["id"], "kind": "pre",
-                "payload": deepcopy(workout["checkin_payload"]),
-                "evaluation": deepcopy(workout["checkin_evaluation"]), "revision": 1,
-                "created_at": utc_now(), "updated_at": utc_now(),
-            }
+            if "checkin_payload" in workout:
+                checkin_id = str(uuid4())
+                self.checkins[checkin_id] = {
+                    "id": checkin_id, "workout_id": workout["id"], "kind": "pre",
+                    "payload": deepcopy(workout["checkin_payload"]),
+                    "evaluation": deepcopy(workout["checkin_evaluation"]), "revision": 1,
+                    "created_at": utc_now(), "updated_at": utc_now(),
+                }
             return self.get_workout(workout["id"])
         payload = {"workout": workout, "exercises": exercises}
         return execute_operation(self, operation_id, "prepare_workout", workout["id"], payload, save, payload_hash)
@@ -552,9 +707,6 @@ class MemoryRepository:
                 definition = allowed[params["p_replacement_id"]]
                 if not definition.get("active", True) or definition.get("review_status") != "allowed":
                     raise Conflict("replacement_not_allowed")
-                equipment = next((r["payload"]["equipment"] for r in self.checkins.values() if r.get("workout_id") == workout_id and r["kind"] == "pre"), [])
-                if not set(definition.get("equipment", [])).issubset(equipment):
-                    raise Conflict("exercise_unavailable")
                 if definition.get("measurement_type") != allowed[entry["exercise_id"]].get("measurement_type"):
                     raise Conflict("exercise_unavailable")
                 entry.update(

@@ -7,13 +7,7 @@ from zoneinfo import ZoneInfo
 
 
 def due_events(workouts,checkins,now,tz_name):
-    local=now.astimezone(ZoneInfo(tz_name));answered={c.get('workout_id') for c in checkins if c['kind']=='next_day'}
-    events=[]
-    for w in workouts:
-        if w['status'] not in {'completed','stopped_early'} or w['id'] in answered or not w.get('finished_at'):continue
-        finished=datetime.fromisoformat(w['finished_at'].replace('Z','+00:00')).astimezone(local.tzinfo)
-        due=(finished+timedelta(days=1)).replace(hour=9,minute=0,second=0,microsecond=0)
-        if due<=local<due+timedelta(days=1):events.append({'key':'next-day:'+w['id'],'kind':'next_day','tag':'next-day','workout_id':w['id']})
+    local=now.astimezone(ZoneInfo(tz_name));events=[]
     if local.isoweekday()==1 and local.hour>=9:
         week=(local.date()-timedelta(days=7)).isoformat()
         events.append({'key':'review:'+week,'kind':'review','tag':'weekly-review','week_start':week})
@@ -45,7 +39,7 @@ def run_once(repository=None,now=None,sender=None):
         for sub in subscriptions:
             if not sub.get('preferences',{}).get(event['kind']):continue
             logical=event['key']+':'+sub['id']
-            claim=r._rpc('gym_claim_notification',{'p_key':logical,'p_kind':'next_day_checkin' if event['kind']=='next_day' else 'weekly_review'})
+            claim=r._rpc('gym_claim_notification',{'p_key':logical,'p_kind':'weekly_review'})
             if not claim.get('claimed'):continue
             try:
                 deliver(sub,os.environ['VAPID_PRIVATE_KEY'],os.environ['VAPID_SUBJECT'],event['tag'],sender)

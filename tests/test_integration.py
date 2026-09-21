@@ -23,7 +23,7 @@ def test_reprepare_preserves_identity_and_blocks_without_second_workout(client,a
     r=post(client,auth,f'/api/workouts/{wid}/edit',{'action':'reprepare','revision':2,'checkin':c})
     assert r.status_code==200 and r.json['workout']['checkin_mode']=='red'
     assert repository.get_active_workout() is None
-    assert client.get('/api/today',headers=auth).json['blocked_checkin']['evaluation']['blocks_workout']
+    assert 'blocked_checkin' not in client.get('/api/today',headers=auth).json
 
 
 def test_remove_restore_skip_undo_and_revision_conflict(client,auth):
@@ -56,7 +56,7 @@ def test_extra_date_and_full_bootstrap(client,auth):
     b=prepared(client,auth)
     assert b['workout']['is_extra'] is True and b['workout']['scheduled_date']
     boot=client.get('/api/bootstrap',headers=auth).json
-    assert boot['sessions'] and boot['contract_version']==1
+    assert boot['sessions'] and boot['contract_version']==2
 
 
 def test_incomplete_session_must_finish_early(client,auth):

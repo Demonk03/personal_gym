@@ -191,15 +191,39 @@ def test_full_workout_lifecycle_and_stale_revision(client, auth, repository):
     assert finished.status_code == 200
     assert finished.get_json()["workout"]["status"] == "completed"
 
-    next_day = client.post(
-        f"/api/workouts/{workout_id}/next-day-checkin",
-        json=operation(
-            revision=5,
-            checkin={"pain_change": "same", "leg_symptoms_change": "better", "unusual_fatigue": False, "ready_for_similar_load": True},
-        ), headers=auth,
-    )
-    assert next_day.status_code == 201
-    assert {row["kind"] for row in repository.get_workout(workout_id)["checkins"]} == {"pre", "post", "next_day"}
+    next_day = client.post(f"/api/workouts/{workout_id}/next-day-checkin", json=operation(revision=5), headers=auth)
+    assert next_day.status_code == 404
+    assert {row["kind"] for row in repository.get_workout(workout_id)["checkins"]} == {"pre", "post"}
+
+
+def test_direct_prepare_needs_no_checkin_and_keeps_no_pre_answer(client, auth, repository):
+    session_id = repository.program["session_id"]
+    repository.set_session_weekday(session_id, 2)
+    response = client.post("/api/workouts/prepare", json=operation(
+        session_id=session_id, scheduled_date="2026-09-15",
+    ), headers=auth)
+
+    assert response.status_code == 201
+    bundle = response.get_json()
+    assert bundle["workout"]["checkin_mode"] is None
+    assert bundle["workout"]["rule_version"] == "manual-v1"
+    assert bundle["checkins"] == []
+
+
+def test_program_schedule_controls_are_available(client, auth, repository):
+    session_id = repository.program["session_id"]
+    program_id = repository.program["id"]
+
+    assert client.get("/api/programs", headers=auth).status_code == 200
+    assert client.put("/api/programs/selection", json={"program_version_id": program_id}, headers=auth).status_code == 200
+    weekday = client.put(f"/api/programs/sessions/{session_id}/weekday", json={"weekday": 2}, headers=auth)
+    skipped = client.put("/api/schedule/2026-09-15", json={
+        "choice": "skipped", "assigned_session_id": session_id,
+    }, headers=auth)
+
+    assert weekday.get_json()["weekday"] == 2
+    assert skipped.get_json()["choice"] == "skipped"
+    assert client.delete("/api/schedule/2026-09-15", headers=auth).get_json()["restored"] is True
 
 
 def test_cancel_only_preparing_workout(client, auth):

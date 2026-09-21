@@ -136,6 +136,34 @@ def definition_snapshot(exercise_id: str, exercise: dict[str, Any]) -> dict[str,
     }
 
 
+def build_direct_workout(program: dict[str, Any]) -> dict[str, Any]:
+    library = program.get("exercise_library", {})
+    plan = []
+    for source in program.get("exercises", []):
+        exercise_id = source["exercise_id"]
+        definition = library.get(exercise_id)
+        if not definition:
+            raise ValueError(f"unknown_exercise:{exercise_id}")
+        if not is_program_eligible(definition):
+            raise ValueError(f"exercise_not_allowed:{exercise_id}")
+        plan.append({
+            "id": str(uuid4()), "original_exercise_id": exercise_id, "exercise_id": exercise_id,
+            "name": definition["name"], "position": len(plan) + 1,
+            "planned_sets": source["planned_sets"], "planned_reps": source.get("planned_reps"),
+            "planned_seconds": source.get("planned_seconds"),
+            "planned_weight_kg": source.get("planned_weight_kg"),
+            "replacement_reason": None, "demo_only": bool(definition.get("demo_only", True)),
+            "definition_snapshot": definition_snapshot(exercise_id, definition), "is_ad_hoc": False,
+        })
+    if not plan:
+        raise ValueError("empty_plan")
+    return {"program_version": program["version"], "program_version_id": program.get("id"),
+            "program_session_id": program.get("session_id"), "rule_version": "manual-v1",
+            "demo_only": bool(program.get("demo_only", True)), "mode": None,
+            "adaptation_reasons": [], "exercises": plan, "omitted": [],
+            "source_snapshot": deepcopy(program)}
+
+
 def _yellow_value(value: Any, factor: float) -> Any:
     return None if value is None else max(1, floor(value * factor))
 

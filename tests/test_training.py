@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from training import build_workout, evaluate_checkin
+from training import build_direct_workout, build_workout, evaluate_checkin
 from db import demo_rules
 
 
@@ -122,6 +122,15 @@ def test_red_mode_builds_no_workout(program):
     checkin["leg_symptoms"]["saddle_numbness"] = True
     result = evaluate_checkin(checkin, program["rules"])
     assert build_workout(program, result, ["mat", "bands"]) is None
+
+
+def test_direct_workout_keeps_published_dose_without_checkin_or_equipment_filter(program):
+    result = build_direct_workout(program)
+
+    assert result["mode"] is None
+    assert result["rule_version"] == "manual-v1"
+    assert [item["exercise_id"] for item in result["exercises"]] == ["bird-dog", "band-row", "bike-easy"]
+    assert result["omitted"] == []
 
 
 def test_build_rejects_unknown_exercise(program):

@@ -1,11 +1,16 @@
 export const uuid=()=>crypto.randomUUID();
-export function nextScheduledSession(sessions,workouts,today){
- const date=new Date(today+'T12:00:00Z'),weekday=date.getUTCDay()||7;
- const finished=new Set(workouts.filter(w=>w&&!w.is_extra&&w.scheduled_date===today&&['completed','stopped_early'].includes(w.status)).map(w=>w.program_session_id));
- const choices=(sessions||[]).map(session=>{let days=(session.weekday-weekday+7)%7;if(days===0&&finished.has(session.session_id))days=7;return {session,days}}).sort((a,b)=>a.days-b.days);
- if(!choices.length)return null;
- date.setUTCDate(date.getUTCDate()+choices[0].days);
- return {session:choices[0].session,date:date.toISOString().slice(0,10),isToday:choices[0].days===0};
+export function nextScheduledSession(sessions,workouts,today,dayChoices=[],alternateSessions=[]){
+ const byId=new Map([...sessions,...alternateSessions].map(s=>[s.session_id,s]));
+ const choices=new Map(dayChoices.map(c=>[c.scheduled_date,c]));
+ for(let days=0;days<35;days++){
+  const date=new Date(today+'T12:00:00Z');date.setUTCDate(date.getUTCDate()+days);
+  const day=date.toISOString().slice(0,10),choice=choices.get(day);
+  if(workouts.some(w=>w&&!w.is_extra&&w.scheduled_date===day&&['completed','stopped_early'].includes(w.status)))continue;
+  if(choice?.choice==='skipped')continue;
+  const session=choice?.choice==='session'?byId.get(choice.session_id):sessions.find(s=>s.weekday===(date.getUTCDay()||7));
+  if(session)return {session,date:day,isToday:days===0};
+ }
+ return null;
 }
 export class APIError extends Error{constructor(message,status=0,code='network'){super(message);this.status=status;this.code=code}}
 export async function request(config,path,{method='GET',body,timeout=60000}={}){

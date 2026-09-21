@@ -15,7 +15,7 @@ Private single-user training PWA. Product requirements live in `SPEC.md`; archit
 docs/ PWA (after design approval)
         ↓ Bearer API key
 app.py Flask API (Railway)
-        ├─ training.py → deterministic check-in and workout plan
+        ├─ training.py → deterministic published workout plan
         ├─ operations.py → idempotent writes
         ├─ metrics.py → progress calculations
         ├─ db.py → Supabase
@@ -24,8 +24,8 @@ app.py Flask API (Railway)
 
 ## Safety boundary
 
-- Exercise selection, check-in modes, and workout blocking are deterministic and never delegated to AI.
-- The active 2–3 week program is an operationally approved pilot (`pilot-rules-v1`), not medical clearance. Its thresholds intentionally match the earlier deterministic demo rules until they are reviewed separately.
+- Exercise selection and workout construction are deterministic and never delegated to AI.
+- New workouts start without a pre-workout or next-day check-in. The retired rules and historical answers remain readable for compatibility, but they do not control new plans.
 - Only active exercise cards with `review_status=allowed` may be included in a program. The activation SQL and database trigger enforce this invariant.
 - AI may summarize saved facts and suggest IDs from the approved library. It cannot add exercises, diagnose, or override a blocked workout.
 - Real medical data, exports, database backups, and secrets do not belong in Git.
@@ -40,7 +40,7 @@ Apply database files in this order:
 
 For a fresh installation, the repeatable pilot migration approves 10 pilot exercise cards, blocks 5 excluded exercises, sets the rest to `needs_review`, and activates sessions on Monday and Wednesday only. For an existing three-session pilot, use `supabase/remove_scheduled_cardio.sql` to preserve manual catalog changes and historical workouts. Ordinary walking is not a scheduled workout.
 
-The PWA renders `pilot-rules-v1` as `ПИЛОТ`. Do not replace it with `ПРОГРАММА` until the check-in rules have been separately approved.
+After the pilot migration, apply `supabase/multiple_programs.sql` twice before using program selection, editable weekdays or date overrides.
 
 ## Checks
 

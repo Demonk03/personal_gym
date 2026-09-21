@@ -29,9 +29,9 @@ def register_notifications(app, repo, auth):
         if u.scheme!='https' or u.hostname not in allowed or u.username or u.password or u.port not in {None,443}:raise APIError('Неизвестный сервер push')
         for k in ('p256dh','auth'):
             if not isinstance(keys.get(k),str) or not re.fullmatch(r'[A-Za-z0-9_=-]{16,200}',keys[k]):raise APIError('Некорректный ключ подписки')
-        if any(not isinstance(prefs.get(k),bool) for k in ('next_day','review')):raise APIError('Некорректные настройки')
+        if set(prefs) != {'review'} or not isinstance(prefs.get('review'),bool):raise APIError('Некорректные настройки')
         row={'id':str(uuid5(NAMESPACE_URL,url)),'endpoint':url,'p256dh':keys['p256dh'],'auth':keys['auth'],
-             'active':any(prefs[k] for k in ('next_day','review')),'preferences':{k:prefs[k] for k in ('next_day','review')}}
+             'active':prefs['review'],'preferences':{'review':prefs['review']}}
         r=repo()
         if hasattr(r,'client'):r.client.table('push_subscriptions').upsert(row,on_conflict='endpoint').execute()
         else:

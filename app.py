@@ -16,12 +16,13 @@ import db
 import gpt
 import operations
 from metrics import build_progress
-from training import build_workout, evaluate_checkin
+from training import build_direct_workout, build_workout, evaluate_checkin
 
 
 EXERCISE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,63}$")
 MEASUREMENT_TYPES = {"reps", "seconds", "weighted_reps", "reps_seconds"}
 REVIEW_STATUSES = {"allowed", "conditional", "needs_review", "blocked"}
+BODY_AREAS = {"спина", "грудь", "плечи", "руки", "ноги", "корпус", "всё тело"}
 
 
 class APIError(Exception):
@@ -127,23 +128,6 @@ def _post_checkin(payload: Any) -> dict[str, Any]:
     return result
 
 
-def _next_day_checkin(payload: Any) -> dict[str, Any]:
-    if not isinstance(payload, dict):
-        raise APIError("Поле checkin должно быть объектом")
-    pain_change = _text(payload, "pain_change", required=True, max_length=20)
-    leg_change = _text(payload, "leg_symptoms_change", required=True, max_length=20)
-    if pain_change not in {"better", "same", "worse"} or leg_change not in {"better", "same", "worse"}:
-        raise APIError("Некорректное изменение симптомов")
-    unusual_fatigue = payload.get("unusual_fatigue")
-    ready_similar = payload.get("ready_for_similar_load")
-    if not isinstance(unusual_fatigue, bool) or not isinstance(ready_similar, bool):
-        raise APIError("Поля усталости и готовности должны быть true или false")
-    return {
-        "pain_change": pain_change, "leg_symptoms_change": leg_change,
-        "unusual_fatigue": unusual_fatigue, "ready_for_similar_load": ready_similar,
-    }
-
-
 def _allowed_origins() -> set[str]:
     configured = os.getenv("DASHBOARD_ORIGIN", "http://localhost:8000")
     return {value.strip().rstrip("/") for value in configured.split(",") if value.strip()}
@@ -223,6 +207,43 @@ def create_app(repository=None, weekly_review_service=None) -> Flask:
     def bootstrap():
         return jsonify(repo().bootstrap())
 
+    @app.get("/api/programs")
+    @require_api_key
+    def programs():
+        return jsonify({"programs": repo().list_programs()})
+
+    @app.put("/api/programs/selection")
+    @require_api_key
+    def select_program():
+        payload = _json()
+        selected = repo().select_program(_uuid(payload.get("program_version_id"), "program_version_id"))
+        return jsonify(selected)
+
+    @app.put("/api/programs/sessions/<session_id>/weekday")
+    @require_api_key
+    def set_program_weekday(session_id):
+        payload = _json()
+        return jsonify(repo().set_session_weekday(_uuid(session_id, "session_id"), _integer(payload, "weekday", 1, 7)))
+
+    @app.put("/api/schedule/<scheduled_date>")
+    @require_api_key
+    def set_schedule_day(scheduled_date):
+        day_date = _date({"date": scheduled_date}, "date")
+        payload = _json()
+        choice = payload.get("choice")
+        if choice not in ("session", "skipped"):
+            raise APIError("Некорректный выбор занятия")
+        session_id = _uuid(payload.get("session_id"), "session_id") if choice == "session" else None
+        if session_id:
+            repo().get_program_by_session_id(session_id)
+        assigned_id = _uuid(payload["assigned_session_id"], "assigned_session_id") if payload.get("assigned_session_id") else None
+        return jsonify(repo().set_day_choice(day_date, choice, session_id, assigned_id))
+
+    @app.delete("/api/schedule/<scheduled_date>")
+    @require_api_key
+    def clear_schedule_day(scheduled_date):
+        return jsonify(repo().clear_day_choice(_date({"date": scheduled_date}, "date")))
+
     @app.get("/api/exercises")
     @require_api_key
     def exercise_catalog():
@@ -235,7 +256,7 @@ def create_app(repository=None, weekly_review_service=None) -> Flask:
     @require_api_key
     def update_exercise(exercise_id):
         payload = _json()
-        allowed = {"name", "measurement_type", "review_status", "note", "active", "revision"}
+        allowed = {"name", "measurement_type", "review_status", "note", "active", "body_areas", "revision"}
         if set(payload) - allowed:
             raise APIError("Переданы неизвестные поля")
         changes = {}
@@ -257,6 +278,11 @@ def create_app(repository=None, weekly_review_service=None) -> Flask:
             if not isinstance(payload["active"], bool):
                 raise APIError("Поле active должно быть true или false")
             changes["active"] = payload["active"]
+        if "body_areas" in payload:
+            areas = payload["body_areas"]
+            if not isinstance(areas, list) or len(areas) > 7 or any(not isinstance(area, str) or area not in BODY_AREAS for area in areas) or len(areas) != len(set(areas)):
+                raise APIError("Некорректные области тела")
+            changes["body_areas"] = areas
         if not changes:
             raise APIError("Нет изменений упражнения")
         return jsonify(repo().update_exercise(
@@ -284,20 +310,34 @@ def create_app(repository=None, weekly_review_service=None) -> Flask:
         payload = _json()
         operation_id = _operation(payload)
         checkin = payload.get("checkin")
-        if not isinstance(checkin, dict):
-            raise APIError("Поле checkin должно быть объектом")
         session_key = _text(payload, "session_key", required=False, max_length=80) or None
-        program = repo().get_program(session_key)
-        evaluation = evaluate_checkin(checkin, program["rules"])
-        if not evaluation["complete"]:
+        scheduled_date = _date(payload, "scheduled_date") or datetime.now(ZoneInfo((repo().bootstrap().get("profile") or {}).get("timezone", "Europe/Belgrade"))).date().isoformat()
+        is_extra = payload.get("is_extra", False)
+        if not isinstance(is_extra, bool):
+            raise APIError("is_extra должно быть true или false")
+        if checkin is None and not is_extra:
+            resolved = repo().resolve_session(scheduled_date)
+            program = resolved["program"]
+            if payload.get("session_id") and _uuid(payload["session_id"], "session_id") != program["session_id"]:
+                raise APIError("Занятие не соответствует расписанию", 409, "schedule_conflict")
+            assigned_session_id = resolved["assigned_session_id"]
+        else:
+            program = (repo().get_program_by_session_id(_uuid(payload["session_id"], "session_id"))
+                       if payload.get("session_id") else repo().get_program(session_key))
+            assigned_session_id = program["session_id"]
+        if checkin is not None and not isinstance(checkin, dict):
+            raise APIError("Поле checkin должно быть объектом")
+        evaluation = evaluate_checkin(checkin, program["rules"]) if checkin is not None else None
+        if evaluation and not evaluation["complete"]:
             raise APIError("Заполни обязательные поля check-in", 422, "checkin_incomplete")
         request_hash = operations.body_hash(payload)
-        if evaluation["blocks_workout"]:
+        if evaluation and evaluation["blocks_workout"]:
             result = repo().save_blocked_checkin(operation_id, request_hash, checkin, evaluation)
             return jsonify(result)
-        if not isinstance(payload.get("is_extra", False), bool):
-            raise APIError("is_extra должно быть true или false")
-        plan = build_workout(program, evaluation, checkin["equipment"])
+        try:
+            plan = build_workout(program, evaluation, checkin["equipment"]) if evaluation else build_direct_workout(program)
+        except ValueError as error:
+            raise APIError(str(error), 422, "invalid_program") from error
         workout_id = str(uuid5(NAMESPACE_URL, f"personal-gym:{operation_id}:workout"))
         exercises = []
         for position, item in enumerate(plan["exercises"], 1):
@@ -305,15 +345,17 @@ def create_app(repository=None, weekly_review_service=None) -> Flask:
         workout = {
             "id": workout_id, "program_version_id": plan["program_version_id"],
             "program_session_id": plan["program_session_id"],
-            "scheduled_date": _date(payload, "scheduled_date") or datetime.now(ZoneInfo((repo().bootstrap().get("profile") or {}).get("timezone", "Europe/Belgrade"))).date().isoformat(),
-            "is_extra": payload.get("is_extra", False), "omitted": plan["omitted"],
-            "status": "preparing", "checkin_mode": evaluation["mode"],
-            "checkin_reasons": evaluation["reasons"], "demo_only": plan["demo_only"],
+            "assigned_session_id": assigned_session_id,
+            "scheduled_date": scheduled_date,
+            "is_extra": is_extra, "omitted": plan["omitted"],
+            "status": "preparing", "checkin_mode": evaluation["mode"] if evaluation else None,
+            "checkin_reasons": evaluation["reasons"] if evaluation else [], "demo_only": plan["demo_only"],
             "rule_version": plan["rule_version"], "profile_snapshot": repo().bootstrap().get("profile") or {},
-            "program_snapshot": {**plan["source_snapshot"], "omitted": plan["omitted"]}, "checkin_payload": checkin,
-            "checkin_evaluation": evaluation, "revision": 1,
+            "program_snapshot": {**plan["source_snapshot"], "omitted": plan["omitted"]}, "revision": 1,
             "created_at": datetime.now(timezone.utc).isoformat(), "updated_at": datetime.now(timezone.utc).isoformat(),
         }
+        if evaluation:
+            workout.update(checkin_payload=checkin, checkin_evaluation=evaluation)
         return jsonify(repo().prepare_workout(operation_id, request_hash, workout, exercises)), 201
 
     def mutation_payload():
@@ -485,15 +527,6 @@ def create_app(repository=None, weekly_review_service=None) -> Flask:
             p_reason=_text(payload, "reason", max_length=500))
         return jsonify(result)
 
-    @app.post("/api/workouts/<workout_id>/next-day-checkin")
-    @require_api_key
-    def next_day(workout_id):
-        payload, operation_id, digest = mutation_payload()
-        result = repo().mutate_workout("next_day_checkin", operation_id, digest,
-            p_workout_id=_uuid(workout_id, "workout_id"), p_revision=_integer(payload, "revision", 1, 1_000_000),
-            p_payload=_next_day_checkin(payload.get("checkin")))
-        return jsonify(result), 201
-
     @app.get("/api/history")
     @require_api_key
     def history():
@@ -614,9 +647,8 @@ def create_app(repository=None, weekly_review_service=None) -> Flask:
         end = (date.fromisoformat(week_start) + timedelta(days=6)).isoformat()
         facts = build_progress(repo().progress_data(week_start, end), profile.get("timezone", "Europe/Belgrade"), profile.get("target_weight_kg"))
         completed = {w["id"] for w in source.get("workouts", []) if w["status"] in {"completed", "stopped_early"}}
-        answered = {c.get("workout_id") for c in source.get("checkins", []) if c["kind"] == "next_day"}
         return jsonify({"week_start": week_start, "review": review, "facts": facts,
-            "coverage": {"workouts": len(completed), "next_day_missing": len(completed - answered)}, "no_data": not completed})
+            "coverage": {"workouts": len(completed)}, "no_data": not completed})
 
     @app.post("/api/weekly-reviews/generate")
     @require_api_key

@@ -617,8 +617,6 @@ begin
   perform 1 from workouts where id=p_workout_id for update;
   if exists(select 1 from workout_sets where workout_exercise_id=p_entry_id) then raise exception 'exercise_has_sets'; end if;
   if replacement_definition->>'measurement_type' <> entry.definition_snapshot->>'measurement_type' then raise exception 'exercise_unavailable'; end if;
-  if exists(select 1 from checkins c where c.workout_id=p_workout_id and c.kind='pre'
-     and not (coalesce(c.payload->'equipment','[]') @> coalesce(replacement_definition->'equipment','[]'))) then raise exception 'exercise_unavailable'; end if;
   update workout_exercises set exercise_id=p_replacement_id,replacement_reason=p_reason,
     definition_snapshot=jsonb_build_object('id',p_replacement_id,'name',replacement_definition->>'name',
       'measurement_type',replacement_definition->>'measurement_type','note',coalesce(replacement_definition->>'note','')),
@@ -936,7 +934,7 @@ declare
   old_row jsonb; card exercise_library; definition jsonb; source jsonb;
   seen_ids uuid[] := '{}'; seen_positions integer[] := '{}';
   entry_id uuid; chosen text; pos integer; baseline_count integer; matched_count integer := 0;
-  set_type text; result jsonb; equipment jsonb;
+  set_type text; result jsonb;
 begin
   claim := gym_claim_operation(p_operation_id,'commit_offline_workout',p_workout_id,p_body_hash);
   if claim->>'status'<>'claimed' then return claim; end if;
@@ -958,10 +956,6 @@ begin
     raise exception 'offline_server_facts_exist'; end if;
   select count(*), coalesce(jsonb_agg(to_jsonb(e)),'[]'::jsonb) into baseline_count,old_rows
     from workout_exercises e where e.workout_id=p_workout_id;
-  select coalesce(payload->'equipment','[]'::jsonb) into equipment
-    from checkins where workout_id=p_workout_id and kind='pre';
-  equipment := coalesce(equipment,'[]'::jsonb);
-
   -- Validate entries and create custom cards before replacing any workout rows.
   for item in select value from jsonb_array_elements(p_payload->'entries') loop
     entry_id := (item->>'id')::uuid;
@@ -984,7 +978,6 @@ begin
         if source is null or not coalesce(source->'allowed_replacements','[]'::jsonb) ? chosen
            or definition is null or definition->>'review_status'<>'allowed'
            or not coalesce((definition->>'active')::boolean,true)
-           or not equipment @> coalesce(definition->'equipment','[]'::jsonb)
            or definition->>'measurement_type'<>old_row->'definition_snapshot'->>'measurement_type'
         then raise exception 'replacement_not_allowed'; end if;
       end if;

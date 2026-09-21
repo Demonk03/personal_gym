@@ -10,31 +10,19 @@ test('exercise library interface exposes quick entry, statuses, and all measurem
  assert.match(source,/data-action="catalog-edit"/);assert.match(source,/'create-exercise'/);
 });
 
-test('program badge labels pilot rules honestly on the program screen',()=>{
+test('program screen exposes selection, weekdays, body areas, and program tags',()=>{
  const source=fs.readFileSync(path.join(__dirname,'../docs/app.js'),'utf8');
- assert.match(source,/const programBadge=/);
- assert.match(source,/pilot-rules-v1.*ПИЛОТ/);
- assert.equal((source.match(/programBadge\(boot\.program\)/g)||[]).length,1);
+ for(const text of ['program-select','weekday-set','catalogArea','body_areas','programTags'])assert.match(source,new RegExp(text));
 });
 
-test('today weight can collapse and usual pain skips optional symptom questions',()=>{
+test('today starts the selected plan directly and exposes date override or skip',()=>{
  const source=fs.readFileSync(path.join(__dirname,'../docs/app.js'),'utf8');
  assert.match(source,/link\(weightOpen\?'Свернуть':'Записать','weight-toggle'\)/);
- assert.match(source,/choices\('Боль в спине\/ногах'/);
- assert.match(source,/ci\.pain_change!=='same'/);
- assert.match(source,/choices\('Симптомы в ноге'.*false\)/);
- assert.match(source,/choices\('Слабость в ноге'.*false\)/);
- assert.doesNotMatch(source,/choices\('Онемение в области промежности'|<h2>Необычные ощущения<\/h2>/);
- assert.match(source,/pain_change==='same'\?\{\}:\{leg_symptoms:/);
-});
-
-test('pre-workout form uses saved equipment without asking for confirmation',()=>{
- const source=fs.readFileSync(path.join(__dirname,'../docs/app.js'),'utf8');
- const form=source.slice(source.indexOf('function checkinView()'),source.indexOf('function planView()'));
- assert.doesNotMatch(form,/Доступное оборудование|Оборудование указано верно|equipment_confirmed/);
- assert.doesNotMatch(source,/if\(action==='equipment'\)/);
- assert.match(source,/ci=\{equipment:boot\.profile\?\.equipment\|\|\[\]\}/);
- assert.match(source,/equipment:equipment\?\?boot\.profile\?\.equipment\?\?\[\]/);
+ assert.match(source,/'prepare-session'/);
+ assert.match(source,/'day-alternates'/);
+ assert.match(source,/'day-skip'/);
+ assert.match(source,/'day-restore'/);
+ assert.doesNotMatch(source,/function checkinView|Начать check-in|nextDayCard|next-day-checkin|Ответ на следующий день/);
 });
 
 test('offline workout routes local actions to a draft until one final commit',async()=>{

@@ -1,6 +1,6 @@
 """Handoff integration: explicit edit operations and read models for the PWA."""
 from copy import deepcopy
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
@@ -72,15 +72,8 @@ def register_integration(app, repo, auth):
         r = repo(); boot = r.bootstrap()
         tz = ZoneInfo((boot.get('profile') or {}).get('timezone', 'Europe/Belgrade'))
         day = datetime.now(tz).date()
-        checks = rows(r, 'checkins')
-        def local_day(c): return datetime.fromisoformat(c['created_at'].replace('Z','+00:00')).astimezone(tz).date()
-        blocked = [c for c in checks if (c.get('evaluation') or {}).get('blocks_workout') and local_day(c) == day]
-        completed = r.list_history((day-timedelta(days=14)).isoformat(), day.isoformat())
-        answered = {c.get('workout_id') for c in checks if c['kind'] == 'next_day'}
-        due = [w for w in completed if w['status'] in {'completed','stopped_early'} and w['id'] not in answered and w.get('finished_at') and datetime.fromisoformat(w['finished_at'].replace('Z','+00:00')).astimezone(tz).date() < day]
         return jsonify({'date': day.isoformat(), 'active': r.get_active_workout(),
-            'blocked_checkin': sorted(blocked, key=lambda c:c['created_at'])[-1] if blocked else None,
-            'next_day_due': due, 'scheduled': [s for s in boot.get('sessions', []) if s.get('weekday') == day.isoweekday()]})
+            'scheduled': [s for s in boot.get('sessions', []) if s.get('weekday') == day.isoweekday()]})
 
     @app.post('/api/workouts/<workout_id>/edit')
     @auth

@@ -5,11 +5,11 @@ The authoritative rules are implemented in `training.py`. `demo-rules-v1` is use
 ## Read models
 
 - `GET /api/bootstrap`: `contract_version:1`, profile, default program and **sessions[]**. Each session includes name, type, weekday (ISO 1–7), estimated minutes, exercise library, allowed replacements and reasons. History uses its saved program snapshot.
-- `GET /api/today`: local date in profile timezone, active workout bundle, latest blocked check-in for that date, scheduled sessions, and unanswered next-day check-ins from the last 14 days. No answer is fabricated for missing symptoms.
+- `GET /api/today`: local date in profile timezone, active workout bundle and scheduled sessions. Retired pre-workout and next-day check-ins are not offered; historical records remain readable.
 - `GET /api/workouts/:id`: `{workout, exercises, sets, checkins}`. Prepared and mutation responses also return bundles where appropriate. Operation recovery can return a small stored result; the client rereads the bundle before removing the operation from its queue.
 - `GET /api/measurements`: chronological `entries[]`, in cm.
 - `GET /api/exercises?q=`: active exercise cards with manual review status, source, format and revision. Results are cached per connection for offline search.
-- Weekly review GET includes the saved review, deterministic facts, no-data flag and the number of missing next-day answers. The UI shows the preceding complete calendar week, without asserting full data coverage from workout count alone.
+- Weekly review GET includes the saved review, deterministic facts and no-data flag. The UI shows the preceding complete calendar week.
 
 ## Writes
 
@@ -25,7 +25,7 @@ All workout edits, weight writes and measurements require a UUID `idempotency_ke
 | action `undo_set` | set_id, set_revision; only in_progress; the edit is recorded in the audit table |
 | action `edit_post` | post_checkin; only completed/stopped_early; marks the workout edited |
 | `POST /api/measurements` | measured_at with timezone; waist_cm, chest_cm, hips_cm, thigh_cm, each 10–300 |
-| `POST /api/push/subscription` | native PushSubscription JSON and boolean preferences next_day/review |
+| `POST /api/push/subscription` | native PushSubscription JSON and the boolean `review` preference |
 | `PUT /api/exercises/:id` | revision and any manual changes to name, note, measurement_type, review_status or active |
 | `POST /api/workouts/:id/exercises` | revision, stable workout_entry_id, and either an existing exercise ID or a `custom-<uuid>` card with name, format and optional note |
 
