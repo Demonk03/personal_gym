@@ -41,6 +41,21 @@ test('offline workout routes local actions to a draft until one final commit',as
  assert.ok(second.generation>first.generation);
 });
 
+test('add set stays on the exercise and recording advances after planned sets',async()=>{
+ const source=fs.readFileSync(path.join(__dirname,'../docs/app.js'),'utf8');
+ assert.match(source,/data-action="add-set" aria-label="Добавить подход"/);
+ assert.match(source,/btn\('Записать упражнение','record-exercise'/);
+ const {exerciseSetAction}=await import('../docs/data.js');
+ assert.deepEqual(exerciseSetAction('add-set',0,1,false),{log:true,advance:false});
+ assert.deepEqual(exerciseSetAction('record-exercise',0,1,false),{log:true,advance:true});
+ assert.deepEqual(exerciseSetAction('record-exercise',1,1,false),{log:false,advance:true});
+ assert.deepEqual(exerciseSetAction('record-exercise',1,3,false),{log:false,advance:false});
+ assert.deepEqual(exerciseSetAction('record-exercise',2,3,false),{log:true,advance:true});
+ assert.deepEqual(exerciseSetAction('add-set',3,1,false),{log:true,advance:false});
+ assert.deepEqual(exerciseSetAction('record-exercise',1,null,true),{log:false,advance:true});
+ assert.deepEqual(exerciseSetAction('add-set',50,1,false),{log:false,advance:false});
+});
+
 test('nearest workout moves to the next calendar date after the planned session is finished',async()=>{
  const {nextScheduledSession}=await import('../docs/data.js');
  const sessions=[{session_id:'sat',weekday:6},{session_id:'mon',weekday:1}];

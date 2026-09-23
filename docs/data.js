@@ -1,4 +1,11 @@
 export const uuid=()=>crypto.randomUUID();
+export function exerciseSetAction(action,savedCount,plannedSets,isAdHoc){
+ const required=isAdHoc?1:plannedSets;
+ if(action==='add-set')return {log:savedCount<50,advance:false};
+ if(action==='record-exercise'&&savedCount>=required)return {log:false,advance:true};
+ if(action==='record-exercise'&&savedCount<50&&savedCount+1>=required)return {log:true,advance:true};
+ return {log:false,advance:false};
+}
 export function nextScheduledSession(sessions,workouts,today,dayChoices=[],alternateSessions=[]){
  const byId=new Map([...sessions,...alternateSessions].map(s=>[s.session_id,s]));
  const choices=new Map(dayChoices.map(c=>[c.scheduled_date,c]));
