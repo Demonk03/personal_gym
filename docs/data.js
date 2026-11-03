@@ -20,13 +20,27 @@ export function nextScheduledSession(sessions,workouts,today,dayChoices=[],alter
  return null;
 }
 export class APIError extends Error{constructor(message,status=0,code='network'){super(message);this.status=status;this.code=code}}
+export function authHeaders(config){
+ const host=new URL(config.url).hostname;
+ return host.endsWith('.containers.yandexcloud.net')?{'X-Personal-Gym-Key':config.key}:{Authorization:`Bearer ${config.key}`};
+}
 export async function request(config,path,{method='GET',body,timeout=60000}={}){
  const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),timeout);
- try{const response=await fetch(config.url.replace(/\/$/,'')+path,{method,headers:{Authorization:`Bearer ${config.key}`,...(body?{'Content-Type':'application/json'}:{})},body:body?JSON.stringify(body):undefined,signal:controller.signal,cache:'no-store'});
+ try{const response=await fetch(config.url.replace(/\/$/,'')+path,{method,headers:{...authHeaders(config),...(body?{'Content-Type':'application/json'}:{})},body:body?JSON.stringify(body):undefined,signal:controller.signal,cache:'no-store'});
  let data;try{data=await response.json()}catch{throw new APIError('Сервер вернул неожиданный ответ',response.status,'invalid_response')}
  if(!response.ok)throw new APIError(data.error?.message||'Ошибка сервера',response.status,data.error?.code);
  return data;
  }catch(e){if(e instanceof APIError)throw e;throw new APIError(e.name==='AbortError'?'Результат неизвестен. Проверим сохранение.':'Нет связи с сервером',0,e.name==='AbortError'?'timeout':'network')}finally{clearTimeout(timer)}
+}
+export async function confirmStoredWorkout(config,offline){
+ if(offline.state==='recording'||!offline.operation?.id)throw new Error('Сначала завершите локальную тренировку');
+ const id=offline.bundle?.workout?.id;
+ if(!id)throw new Error('Не удалось определить локальную тренировку');
+ const operation=await request(config,`/api/operations/${offline.operation.id}`);
+ if(operation.status!=='succeeded'||operation.result?.workout_id!==id)throw new Error('Сохранение тренировки ещё не подтверждено на новом сервере');
+ const confirmed=await request(config,`/api/workouts/${id}`);
+ if(confirmed.workout?.id!==id||!['completed','stopped_early'].includes(confirmed.workout.status)||!offline.bundle.sets.every(set=>confirmed.sets.some(saved=>saved.id===set.id)))throw new Error('Данные тренировки на новом сервере не совпадают с локальной записью');
+ return confirmed;
 }
 export class Store{
  constructor(name){this.name=name}
