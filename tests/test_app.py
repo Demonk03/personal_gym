@@ -62,6 +62,26 @@ def test_personal_routes_require_key_and_disable_cache(client, auth):
     ).headers
 
 
+def test_personal_routes_accept_container_key_header(client, auth):
+    key = auth["Authorization"].removeprefix("Bearer ")
+    allowed = client.get(
+        "/api/bootstrap", headers={"X-Personal-Gym-Key": key, "Origin": "https://gym.example"}
+    )
+    preflight = client.options(
+        "/api/bootstrap",
+        headers={
+            "Origin": "https://gym.example",
+            "Access-Control-Request-Method": "GET",
+            "Access-Control-Request-Headers": "x-personal-gym-key",
+        },
+    )
+
+    assert allowed.status_code == 200
+    assert preflight.status_code == 200
+    assert "X-Personal-Gym-Key" in preflight.headers["Access-Control-Allow-Headers"]
+    assert client.get("/api/bootstrap", headers={"X-Personal-Gym-Key": "wrong"}).status_code == 401
+
+
 def test_prepare_is_idempotent_and_prevents_two_active_workouts(client, auth, repository):
     operation_id = str(uuid4())
     first, body = prepare(client, auth, operation_id)

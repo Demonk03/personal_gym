@@ -50,3 +50,12 @@ python3 -m py_compile app.py db.py training.py operations.py metrics.py gpt.py j
 npm test
 node --check docs/app.js
 ```
+
+## Агенты
+
+Этот файл — единственный источник контекста проекта: его читают и Claude Code, и Codex
+(у Codex через `project_doc_fallback_filenames` в `~/.codex/config.toml`).
+
+- `AGENTS.md` в проекте не создавать и не вызывать `/init` — обновлять этот файл
+- Задачи и открытые вопросы — в `plan.md`, он же точка синхронизации между агентами
+- В конце сессии, если контекст проекта изменился, обновить соответствующие разделы здесь

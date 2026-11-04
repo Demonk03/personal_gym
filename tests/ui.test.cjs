@@ -56,6 +56,22 @@ test('add set stays on the exercise and recording advances after planned sets',a
  assert.deepEqual(exerciseSetAction('add-set',50,1,false),{log:false,advance:false});
 });
 
+test('container requests use the forwarded API key header without changing Railway requests',async()=>{
+ const {authHeaders}=await import('../docs/data.js');
+ assert.deepEqual(authHeaders({url:'https://abc.containers.yandexcloud.net',key:'secret'}),{'X-Personal-Gym-Key':'secret'});
+ assert.deepEqual(authHeaders({url:'https://personalgym-production.up.railway.app',key:'secret'}),{Authorization:'Bearer secret'});
+});
+
+test('connection migration only accepts an already confirmed local workout',async()=>{
+ const {confirmStoredWorkout}=await import('../docs/data.js');
+ const offline={state:'unknown',operation:{id:'operation-1'},bundle:{workout:{id:'workout-1'},sets:[{id:'set-1'}]}};
+ global.fetch=async(url)=>url.endsWith('/api/operations/operation-1')?response({status:'succeeded',result:{workout_id:'workout-1'}}):response({workout:{id:'workout-1',status:'completed'},sets:[{id:'set-1'}]});
+ assert.equal((await confirmStoredWorkout({url:'https://abc.containers.yandexcloud.net',key:'secret'},offline)).workout.id,'workout-1');
+ global.fetch=async()=>response({status:'pending'});
+ await assert.rejects(confirmStoredWorkout({url:'https://abc.containers.yandexcloud.net',key:'secret'},offline),/ещё не подтверждено/);
+ await assert.rejects(confirmStoredWorkout({url:'https://abc.containers.yandexcloud.net',key:'secret'},{...offline,state:'recording'}),/Сначала завершите/);
+});
+
 test('nearest workout moves to the next calendar date after the planned session is finished',async()=>{
  const {nextScheduledSession}=await import('../docs/data.js');
  const sessions=[{session_id:'sat',weekday:6},{session_id:'mon',weekday:1}];

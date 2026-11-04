@@ -155,7 +155,9 @@ def create_app(repository=None, weekly_review_service=None) -> Flask:
         def wrapper(*args, **kwargs):
             expected = os.getenv("API_KEY", "")
             header = request.headers.get("Authorization", "")
-            provided = header[7:].strip() if header.startswith("Bearer ") else ""
+            provided = request.headers.get("X-Personal-Gym-Key")
+            if provided is None:
+                provided = header[7:].strip() if header.startswith("Bearer ") else ""
             if not expected or not hmac.compare_digest(provided, expected):
                 raise APIError("Неверный API-ключ", 401, "unauthorized")
             return function(*args, **kwargs)
@@ -168,7 +170,7 @@ def create_app(repository=None, weekly_review_service=None) -> Flask:
             response.headers["Access-Control-Allow-Origin"] = origin
             response.headers["Vary"] = "Origin"
         response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
-        response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+        response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Personal-Gym-Key"
         response.headers["Cache-Control"] = "no-store"
         return response
 

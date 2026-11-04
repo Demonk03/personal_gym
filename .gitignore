@@ -5,15 +5,19 @@ __pycache__/
 .pytest_cache/
 *.py[cod]
 node_modules/
+.pnpm-store/
 .DS_Store
 coverage/
 *.log
 exports/
 backups/
 dist/
+*.bak-*
 
 # Private product and health context. Keep these local only.
 SPEC.md
 docs/design/
 docs/superpowers/
 docs/design_handoff_personal_gym/
+supabase/seed_production.sql
+supabase/reset_production.sql
