@@ -110,9 +110,13 @@ export class Queue{
 export function claimLease(current,owner,now,takeover=false){
  if(takeover||!current||current.expires<=now||current.owner===owner)return {owner,expires:now+15000,generation:current?.owner===owner&&!takeover?(current.generation||1):(current?.generation||0)+1};return current;
 }
+export function tabOwner(){
+ try{const stored=sessionStorage.getItem('gym.tab-owner');if(stored)return stored;const fresh=uuid();sessionStorage.setItem('gym.tab-owner',fresh);return fresh}catch{return uuid()}
+}
 export class TabLease{
- constructor(store,onLost){this.store=store;this.owner=uuid();this.onLost=onLost;this.owned=false}
+ constructor(store,onLost){this.store=store;this.owner=tabOwner();this.onLost=onLost;this.owned=false}
  async acquire(takeover=false){const row=await this.store.update('writer',old=>claimLease(old,this.owner,Date.now(),takeover));const owned=row.owner===this.owner;if(this.owned&&!owned)this.onLost();this.owned=owned;this.generation=owned?row.generation:null;return owned}
  start(){this.timer=setInterval(()=>{if(this.owned)void this.acquire()},5000)}
  stop(){clearInterval(this.timer);this.owned=false}
+ async release(){if(!this.owned)return;clearInterval(this.timer);this.owned=false;try{await this.store.update('writer',old=>old&&old.owner===this.owner?{...old,expires:0}:old)}catch{}}
 }
