@@ -51,6 +51,68 @@ npm test
 node --check docs/app.js
 ```
 
+## Hosting and operations
+
+| Piece | Where |
+|---|---|
+| PWA | GitHub Pages, `main` → `/docs`, `https://demonk03.github.io/personal_gym/` |
+| API | Railway, `https://personalgym-production.up.railway.app` |
+| Database | Supabase project `personal_gym`, region `eu-central-1` (ref in the Railway env, not here) |
+
+Frontend and backend deploy separately: pushing to `main` republishes Pages, but the
+Railway service needs its own deploy. After a backend change, confirm Railway picked
+up the commit.
+
+Both the database and the API sleep when unused, and each failure looks different:
+
+- Supabase pauses the project after about a week of inactivity. Every query then fails
+  and `app.py` turns it into a generic 500 "Временная ошибка сервиса". Restoring is only
+  possible from the Supabase dashboard; the MCP tools cannot unpause a project.
+- Railway puts the service to sleep; the first request wakes it and can take a minute.
+  Warm up through `/api/health`, which touches no database. Waking through
+  `/api/bootstrap` is what produced false "Сервер не проснулся" reports.
+
+The generic 500 hides the real cause by design — the traceback goes to the Railway logs
+via `app.logger.exception`, so read them before guessing.
+
+The Railway domain may be unreachable from a Russian ISP: `personalgym-production`
+resolves to a blocked IP while `tenniscoach-production` on a neighbouring IP answers
+normally. A TLS handshake timeout therefore means "blocked here", not "service down" —
+check under VPN before concluding anything.
+
+Tennis Coach shares the `Oura` Supabase project with the health tracker, which is why it
+never sleeps: the Fitbit sync keeps that instance warm. Personal Gym sits on its own
+instance with no such traffic.
+
+## Read performance
+
+Program reads are batched on purpose. `_session_context()` fetches weekdays, entries,
+replacements, the legacy table and the library for a whole set of sessions in five
+queries, and `_program_session()` composes each session from that in memory. Before this,
+one app open cost about 130 Supabase round trips; bootstrap now issues 17 and
+`list_programs` 7, with byte-identical responses.
+
+Do not reintroduce per-session queries: every call is a separate HTTPS round trip to
+`eu-central-1`, so the cost is network, not Postgres.
+
+Writes already go through SQL functions (`gym_add_workout_exercise` and friends). The
+remaining step, if reads ever feel slow again, is to move them into SQL functions too and
+return ready `jsonb`, the way Tennis Coach does with its `pult_*` functions — one round
+trip per screen. Measure before starting: the service region relative to the database may
+matter more than the code.
+
+## Private data in this repository
+
+The repository is public. `supabase/seed_production.sql` and `supabase/reset_production.sql`
+carry real medical notes and are git-ignored; `SPEC.md`, `docs/design/` and
+`docs/superpowers/` are ignored for the same reason. A `.gitignore` entry only helps for
+files Git does not already track, so check `git ls-tree` rather than trusting the ignore
+list.
+
+`tests/schema.test.cjs` asserts on personal values (target weight and the goal wording)
+and reads the ignored production SQL. It stays local until those assertions are
+anonymised.
+
 ## Агенты
 
 Этот файл — единственный источник контекста проекта: его читают и Claude Code, и Codex
