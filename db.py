@@ -73,23 +73,31 @@ class SupabaseRepository:
 
     def bootstrap(self) -> dict[str, Any]:
         profile = self.client.table("player_profile").select("*").eq("id", True).limit(1).execute().data
+        base = {"contract_version": 2, "profile": profile[0] if profile else None}
+        empty = {**base, "program": None, "sessions": []}
         try:
-            program = self.get_program()
+            version = self._selected_version()
         except NotFound:
-            return {"contract_version": 2, "profile": profile[0] if profile else None, "program": None,
-                    "sessions": [], "programs": self.list_programs(), "day_choices": self.list_day_choices()}
-        sessions = self.client.table("program_sessions").select("session_key").eq("program_version_id", program["id"]).order("position").execute().data
-        return {"contract_version": 2, "profile": profile[0] if profile else None, "program": program,
-                "sessions": [self.get_program(row["session_key"]) for row in sessions],
+            return {**empty, "programs": self.list_programs(), "day_choices": self.list_day_choices()}
+        sessions = self.client.table("program_sessions").select("*").eq("program_version_id", version["id"]).order("position").execute().data
+        if not sessions:
+            return {**empty, "programs": self.list_programs(), "day_choices": self.list_day_choices()}
+        context = self._session_context(sessions)
+        built = [self._program_session(version, session, context) for session in sessions]
+        return {**base, "program": built[0], "sessions": built,
                 "programs": self.list_programs(), "day_choices": self.list_day_choices()}
 
     def list_programs(self):
         versions = self.client.table("program_versions").select("*").eq("published", True).order("version").execute().data
-        result = []
-        for version in versions:
-            sessions = self.client.table("program_sessions").select("*").eq("program_version_id", version["id"]).order("position").execute().data
-            result.append({**version, "sessions": [self.get_program_by_session_id(row["id"]) for row in sessions]})
-        return result
+        if not versions:
+            return []
+        sessions = self.client.table("program_sessions").select("*").in_("program_version_id", [v["id"] for v in versions]).order("position").execute().data
+        context = self._session_context(sessions)
+        by_version: dict[str, list] = {}
+        for session in sessions:
+            by_version.setdefault(session["program_version_id"], []).append(session)
+        return [{**version, "sessions": [self._program_session(version, session, context) for session in by_version.get(version["id"], [])]}
+                for version in versions]
 
     def list_day_choices(self):
         return self.client.table("gym_day_choices").select("*").order("scheduled_date").execute().data
@@ -160,7 +168,7 @@ class SupabaseRepository:
         })
         return self.get_workout(result["workout_id"])
 
-    def get_program(self, session_key: str | None = None) -> dict[str, Any]:
+    def _selected_version(self) -> dict[str, Any]:
         selection = self.client.table("gym_program_selection").select("program_version_id").eq("id", True).limit(1).execute().data
         versions = (self.client.table("program_versions").select("*").eq("id", selection[0]["program_version_id"]).limit(1).execute().data
                     if selection else self.client.table("program_versions").select("*").eq("active", True).limit(1).execute().data)
@@ -169,6 +177,10 @@ class SupabaseRepository:
         version = versions[0]
         if not version.get("published", False):
             raise NotFound("active_program_not_found")
+        return version
+
+    def get_program(self, session_key: str | None = None) -> dict[str, Any]:
+        version = self._selected_version()
         query = self.client.table("program_sessions").select("*").eq("program_version_id", version["id"])
         if session_key:
             query = query.eq("session_key", session_key)
@@ -188,26 +200,47 @@ class SupabaseRepository:
             raise Conflict("program_not_published")
         return self._program_session(versions[0], session)
 
-    def _program_session(self, version, session):
-        overrides = self.client.table("gym_session_weekdays").select("weekday").eq("session_id", session["id"]).limit(1).execute().data
-        if overrides:
-            session = {**session, "weekday": overrides[0]["weekday"]}
-        entries = self.client.table("program_session_exercises").select("*").eq("session_id", session["id"]).order("position").execute().data
+    def _session_context(self, sessions):
+        """Загружает за пять запросов всё, что нужно для набора сессий, вместо пяти запросов на каждую."""
+        session_ids = [session["id"] for session in sessions]
+        if not session_ids:
+            return {"weekdays": {}, "entries": {}, "replacements": [], "legacy": [], "library": {}}
+        weekdays = self.client.table("gym_session_weekdays").select("session_id,weekday").in_("session_id", session_ids).execute().data
+        entries = self.client.table("program_session_exercises").select("*").in_("session_id", session_ids).order("position").execute().data
+        entry_ids = [entry["id"] for entry in entries]
+        exercise_ids = [entry["exercise_id"] for entry in entries]
+        replacements = self.client.table("gym_session_replacements").select("*").in_("session_exercise_id", entry_ids).execute().data if entry_ids else []
+        legacy = self.client.table("exercise_replacements").select("*").in_("exercise_id", exercise_ids).execute().data if exercise_ids else []
+        library_ids = set(exercise_ids) | {row["replacement_id"] for row in replacements} | {row["replacement_id"] for row in legacy}
+        library = self.client.table("exercise_library").select("*").in_("id", list(library_ids)).execute().data if library_ids else []
+        grouped: dict[str, list] = {}
+        for entry in entries:
+            grouped.setdefault(entry["session_id"], []).append(entry)
+        return {
+            "weekdays": {row["session_id"]: row["weekday"] for row in weekdays},
+            "entries": grouped,
+            "replacements": replacements,
+            "legacy": legacy,
+            "library": {item["id"]: item for item in library},
+        }
+
+    def _program_session(self, version, session, context=None):
+        context = context if context is not None else self._session_context([session])
+        if session["id"] in context["weekdays"]:
+            session = {**session, "weekday": context["weekdays"][session["id"]]}
+        entries = context["entries"].get(session["id"], [])
         ids = [entry["exercise_id"] for entry in entries]
-        exercises = self.client.table("exercise_library").select("*").in_("id", ids).execute().data
-        replacements = self.client.table("gym_session_replacements").select("*").in_("session_exercise_id", [e["id"] for e in entries]).execute().data if entries else []
+        entry_ids = {entry["id"] for entry in entries}
+        replacements = [row for row in context["replacements"] if row["session_exercise_id"] in entry_ids]
         if entries and not replacements:
-            legacy = self.client.table("exercise_replacements").select("*").in_("exercise_id", ids).execute().data
             replacements = [{"session_exercise_id": e["id"], "replacement_id": row["replacement_id"],
-                             "reason": row["reason"]} for e in entries for row in legacy if e["exercise_id"] == row["exercise_id"]]
+                             "reason": row["reason"]} for e in entries for row in context["legacy"] if e["exercise_id"] == row["exercise_id"]]
         replacement_map: dict[str, list[str]] = {}
         replacement_ids = []
         for row in replacements:
             replacement_map.setdefault(row["session_exercise_id"], []).append(row["replacement_id"])
             replacement_ids.append(row["replacement_id"])
-        if replacement_ids:
-            exercises += self.client.table("exercise_library").select("*").in_("id", replacement_ids).execute().data
-        library = {item["id"]: item for item in exercises}
+        library = {item_id: context["library"][item_id] for item_id in [*ids, *replacement_ids] if item_id in context["library"]}
         return {
             "id": version["id"], "session_id": session["id"], "session_key": session["session_key"],
             "name": session["name"], "session_type": session["session_type"], "weekday": session["weekday"],

@@ -139,15 +139,17 @@ async function recoverDirect(){const op=await store.get('direct');if(!op||!navig
 async function enqueue(path,body,options={}){const item=await queue.add({path,body,method:options.method||'POST',workoutId:options.workoutId,needsRevision:options.needsRevision||false,dependsOn:options.dependsOn});pending=await queue.read();render();return item}
 async function editActive(action,data={}){const b=current();await enqueue(`/api/workouts/${b.workout.id}/edit`,{action,...data},{workoutId:b.workout.id,needsRevision:true})}
 function resetInput(){const e=currentEntry();if(!e)return;input={reps:e.planned_reps||0,seconds:e.planned_seconds||60,kg:Number(fromKg(e.planned_weight_kg||0).toFixed(2))}}
+async function wake(target){
+ try{await request(target,'/api/health',{timeout:10000});return}
+ catch(e){if(e.code!=='timeout')throw e}
+ connectNote='wake';render();
+ try{await request(target,'/api/health',{timeout:90000})}
+ catch(again){throw again.code==='timeout'?new Error('Сервер не ответил за полторы минуты. Подождите полминуты и попробуйте снова — со второй попытки он обычно просыпается.'):again}
+ finally{connectNote='';render()}
+}
 async function bootstrapWithWake(target){
- try{return await request(target,'/api/bootstrap',{timeout:15000})}
- catch(e){
-  if(e.code!=='timeout')throw e;
-  connectNote='wake';render();
-  try{return await request(target,'/api/bootstrap',{timeout:90000})}
-  catch(again){throw again.code==='timeout'?new Error('Сервер не проснулся за полторы минуты. Подождите полминуты и нажмите «Проверить и сохранить» ещё раз — со второй попытки он обычно отвечает.'):again}
-  finally{connectNote=''}
- }
+ await wake(target);
+ return request(target,'/api/bootstrap',{timeout:60000});
 }
 async function handle(action,el){
  if(offline&&offline.state!=='recording'&&['add-set','record-exercise','undo','skip','unskip','attach-exercise','create-exercise','replace-save','finish-save'].includes(action))throw new Error('Итог уже записан на устройстве; дождитесь отправки');
